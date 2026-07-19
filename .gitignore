@@ -1,0 +1,39 @@
+### Python Cache & Bytecode ###
+# Avoid tracking compiled bytecode (.pyc) which Python generates automatically to run faster
+__pycache__/
+*.py[cod]
+*$py.class
+
+### Virtual Environments ###
+# Keeps your heavy local dependency sandboxes out of the repository
+.venv/
+venv/
+env/
+ENV/
+
+### Environment Variables & Secrets ###
+# CRITICAL: Never track files containing API keys, database credentials, or private configuration tokens
+.env
+.env.*
+*.env
+
+### IDE & Text Editor Artifacts ###
+# Keeps local editor settings from fighting with someone else's screen setup
+.vscode/
+.idea/
+*.swp
+*.swo
+
+### Testing, Coverage, & Code Analysis ###
+# Keeps temporary debugging reports out of the clean codebase
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+### Distribution & Packaging (If packaging your app later) ###
+# Temporary directories created when bundling Python code into shareable modules
+build/
+dist/
+*.egg-info/
