@@ -3,6 +3,54 @@
 All notable changes to ScorePrep are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.1.0]
+
+### Added
+
+- `--max-silent-gap` now configurable in interactive mode's advanced
+  options, with an explicit (color-highlighted, when the terminal
+  supports it) warning that raising it usually isn't the fix for
+  "too many rests" at low tie-temperature -- the tie budget itself is
+  almost always the real bottleneck. Raising `--tie-temperature`
+  instead is usually far more effective.
+- Per-staff report now prints `rests=N` alongside `needs-tie=N` -- the
+  tie/rest tradeoff was always there, but only half of it was visible
+  before. Verified against a real file: `rests` dropped from 391 to
+  118 going from tie-temperature 0.0 to 0.1 with zero tie cost (the
+  tie budget itself doesn't increase until roughly 0.15-0.2), then
+  jumped sharply once the tie budget increased -- a genuine "elbow" in
+  the tradeoff, not a smooth curve, and now visible in the tool's own
+  output instead of requiring a manual sweep to discover.
+
+### Improved
+
+- **Excessive rest fragmentation:** a note's notated duration was
+  computed purely from its own natural release time, with no awareness
+  of when the next note starts, so almost every small, non-deliberate
+  gap between a note's release and the next onset became a rest —
+  the dominant source of visual clutter in output scores, not genuine
+  short rests. `--max-silent-gap N` (default 2 grid units) now extends
+  a note to close a small trailing gap instead of leaving a rest,
+  capped so it can never create a note overlap or violate the
+  temperature-scaled bar-span limit `--tie-temperature` already
+  enforces. Verified against the tie-budget and bar-span invariants
+  across all `grid × temperature × gap-threshold` combinations, 0
+  violations.
+
+  (this is only a workaround, a rework is needed to truly balance readbaility, ties and rests, will follow in next versions)
+
+### Added
+
+- `--track` now accepts a comma-separated list (`1,2`) or `all` to merge
+  multiple tracks into one pass, instead of requiring separate runs per
+  track. Useful for sources with separate right-hand/left-hand tracks.
+  Interactive mode's track prompt updated to match.
+- Interactive mode remembers the last input/output paths used (stored in
+  `~/.config/scoreprep/config.json`) and offers them as defaults, so
+  repeated test runs on the same file don't require retyping/pasting
+  paths. If the same input file is reused, the previous output path is
+  offered too (not just the auto-generated name).
+
 ## [1.0.0] — 2026-07-19
 
 First public release. (Formerly developed under the working name

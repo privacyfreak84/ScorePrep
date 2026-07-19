@@ -63,11 +63,45 @@ USAGE
 """
 
 import argparse
+import json
+import os
 import sys
 from collections import defaultdict
 
 import mido
 from mido import MidiFile, MidiTrack, Message, MetaMessage
+
+
+def _config_path():
+    base = os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config')
+    return os.path.join(base, 'scoreprep', 'config.json')
+
+
+def load_last_paths():
+    """Return {'last_input': ..., 'last_output': ...} from a previous run,
+    or {} if there's no saved config or it can't be read. Never raises --
+    this is a convenience, not something that should ever block a run."""
+    try:
+        with open(_config_path()) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_last_paths(input_path, output_path):
+    """Remember the input/output paths just used, so interactive mode can
+    offer them as defaults next time instead of requiring them to be
+    retyped/pasted. Best-effort -- failure here should never interrupt an
+    otherwise-successful conversion."""
+    try:
+        path = _config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            json.dump({'last_input': os.path.abspath(input_path),
+                       'last_output': os.path.abspath(output_path)}, f)
+    except OSError:
+        pass
 
 TICKS_PER_BEAT = 384          # matches this script's assumed source resolution
 SPLIT_PITCH = 60              # middle C
@@ -474,6 +508,48 @@ def sync_chords(notes, temperature=0.0, bar_ticks=None):
             n['f_end'] = min_end
 
 
+def fill_small_gaps(notes, max_gap_units, tie_budget, bar_ticks, max_bars):
+    """A note's notated duration (from resolve_note_durations) reflects
+    only its own natural release time -- it has no awareness of when the
+    next note starts. In a transcription, a note's release almost never
+    lines up exactly with the next onset, so the gap between them becomes
+    a rest -- often a single grid unit or less, which is the dominant
+    source of rest clutter in the output (much more so than genuine
+    intentional short rests).
+
+    If that gap is small (<= max_gap_units grid units), extend the note
+    to close it instead of leaving a sliver of a rest. The extension is
+    capped at whichever is smaller: the next onset in this staff (never
+    creates an overlap), or the same temperature-scaled bar-span room
+    resolve_note_durations itself enforces (so temperature=0.0 still
+    keeps notes within their own bar, exactly as before -- this pass
+    must not reintroduce cross-bar spans that setting was meant to
+    prevent). The resulting duration is re-snapped with
+    best_units_within_budget, so it can only partially close the gap (or
+    not at all) rather than ever exceeding the tie budget -- never worse
+    than leaving the rest. Mutates 'f_end' in place. Chord members
+    sharing an onset extend to the same new length by construction, so
+    this can't refracture a chord sync_chords already unified."""
+    if max_gap_units <= 0 or not notes:
+        return
+    onsets = sorted(set(n['f_start'] for n in notes))
+    next_onset_after = {a: b for a, b in zip(onsets, onsets[1:])}
+    for n in notes:
+        nxt = next_onset_after.get(n['f_start'])
+        if nxt is None:
+            continue
+        gap = nxt - n['f_end']
+        if gap <= 0 or gap > max_gap_units * GRID:
+            continue
+        bar_start = (n['f_start'] // bar_ticks) * bar_ticks
+        room = bar_start + max_bars * bar_ticks - n['f_start']
+        target_units = min(nxt - n['f_start'], room) // GRID
+        final_units = best_units_within_budget(target_units, tie_budget)
+        new_end = n['f_start'] + final_units * GRID
+        if new_end > n['f_end']:
+            n['f_end'] = new_end
+
+
 def fix_same_pitch_overlaps(notes, tie_budget=1):
     """Prevent a pitch's note-off happening after the next note-on of the
     same pitch (can happen after rounding).
@@ -568,6 +644,28 @@ def build_pedal_track(pedal_windows):
         last_tick = tick
     trk.append(MetaMessage('end_of_track', time=0))
     return trk
+
+
+def parse_track_selector(s, num_tracks):
+    """Parse a --track value: a single index ('2'), a comma-separated list
+    ('1,2'), or 'all'. Returns a sorted, de-duplicated list of track
+    indices. Raises ValueError on bad input (caller turns that into a
+    clean CLI error, not a traceback)."""
+    s = s.strip().lower()
+    if s == 'all':
+        return list(range(num_tracks))
+    indices = set()
+    for part in s.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            indices.add(int(part))
+        except ValueError:
+            raise ValueError(f"'{part}' is not a valid track index")
+    if not indices:
+        raise ValueError("no track index given")
+    return sorted(indices)
 
 
 def summarize_tracks(mid):
@@ -809,14 +907,18 @@ def report(name, notes, bar_ticks):
     for n in notes:
         by_onset[n['f_start']].add(n['f_end'] - n['f_start'])
     conflicts = sum(1 for durs in by_onset.values() if len(durs) > 1)
-    print(f"  {name}: {len(notes)} notes | needs-tie={needs_tie} (max chain={max_ties}) "
+    onsets = sorted(set(n['f_start'] for n in notes))
+    next_onset_after = {a: b for a, b in zip(onsets, onsets[1:])}
+    rests = sum(1 for n in notes
+                if (nxt := next_onset_after.get(n['f_start'])) is not None and nxt - n['f_end'] > 0)
+    print(f"  {name}: {len(notes)} notes | needs-tie={needs_tie} (max chain={max_ties}) rests={rests} "
           f"cross-bar={cross_bar} chord-conflicts={conflicts}", file=sys.stderr)
 
 
 def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
         pedal_mode='ignore', min_note_ticks=None, playback_sustain=True, grid_mode='straight',
-        track_override=None, channel_override=None, duration_style='dotted',
-        min_velocity=0, velocity_mode='passthrough', velocity_scale=1.0):
+        track_selector=None, channel_override=None, duration_style='dotted',
+        min_velocity=0, velocity_mode='passthrough', velocity_scale=1.0, max_silent_gap=2):
     """Runs the full cleanup pipeline. Shared by --interactive and normal
     CLI-argument mode. tempo, split_pitch, and time_sig may be None, in
     which case they're estimated from the source file."""
@@ -844,40 +946,55 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
               f"Grid/bar math assumes {TICKS_PER_BEAT}; results may be off.", file=sys.stderr)
 
     track_summary = summarize_tracks(mid)
-    if track_override is not None:
-        if not (0 <= track_override < len(mid.tracks)):
-            sys.exit(f"Error: --track {track_override} out of range -- file has "
+    if track_selector is not None:
+        try:
+            track_indices = parse_track_selector(str(track_selector), len(mid.tracks))
+        except ValueError as e:
+            sys.exit(f"Error: --track: {e}")
+        bad = [t for t in track_indices if not (0 <= t < len(mid.tracks))]
+        if bad:
+            sys.exit(f"Error: --track index/indices {bad} out of range -- file has "
                      f"{len(mid.tracks)} track(s) (valid: 0-{len(mid.tracks) - 1}).")
-        track_idx = track_override
-        _, name, count, channels = track_summary[track_idx]
-        print(f"--track {track_idx} given -- using it explicitly "
-              f"({count} note_on event(s){f', name \"{name}\"' if name else ''}"
-              f"{f', channels used: {channels}' if channels else ''})", file=sys.stderr)
+        if len(track_indices) == 1:
+            i = track_indices[0]
+            _, name, count, channels = track_summary[i]
+            print(f"--track {i} given -- using it explicitly "
+                  f"({count} note_on event(s){f', name \"{name}\"' if name else ''}"
+                  f"{f', channels used: {channels}' if channels else ''})", file=sys.stderr)
+        else:
+            parts = "; ".join(f"track {i}{f' (\"{n}\")' if n else ''} [{c} notes]"
+                               for i, n, c, _ch in (track_summary[t] for t in track_indices))
+            print(f"--track {','.join(map(str, track_indices))} given -- merging "
+                  f"{len(track_indices)} tracks: {parts}", file=sys.stderr)
     else:
-        track_idx = find_note_track(mid)
-        if track_idx is None:
+        auto_idx = find_note_track(mid)
+        if auto_idx is None:
             sys.exit("No note events found in any track.")
-        _, name, count, channels = track_summary[track_idx]
-        print(f"No --track given -- auto-selected track {track_idx} as the note track "
+        track_indices = [auto_idx]
+        _, name, count, channels = track_summary[auto_idx]
+        print(f"No --track given -- auto-selected track {auto_idx} as the note track "
               f"({count} note_on event(s){f', name \"{name}\"' if name else ''}"
               f"{f', channels used: {channels}' if channels else ''})", file=sys.stderr)
-        ambiguity = describe_track_ambiguity(track_summary, track_idx)
+        ambiguity = describe_track_ambiguity(track_summary, auto_idx)
         if ambiguity:
             print(ambiguity, file=sys.stderr)
 
     if channel_override is not None:
         if not (0 <= channel_override <= 15):
             sys.exit(f"Error: --channel {channel_override} out of range (valid: 0-15).")
-        print(f"--channel {channel_override} given -- filtering track {track_idx} to that "
-              f"channel only", file=sys.stderr)
+        print(f"--channel {channel_override} given -- filtering to that channel only",
+              file=sys.stderr)
 
-    notes = extract_notes(mid.tracks[track_idx], channel=channel_override)
+    notes = []
+    for t in track_indices:
+        notes.extend(extract_notes(mid.tracks[t], channel=channel_override))
+    notes.sort(key=lambda n: (n['start'], n['pitch']))
     if not notes:
         listing = "\n".join(
             f"  track {i}: {c} note_on event(s){f', name \"{n}\"' if n else ''}"
             f"{f', channels used: {ch}' if ch else ''}"
             for i, n, c, ch in track_summary)
-        sys.exit(f"Error: no notes found on track {track_idx}"
+        sys.exit(f"Error: no notes found on track(s) {track_indices}"
                  f"{f' channel {channel_override}' if channel_override is not None else ''}. "
                  f"Tracks in this file:\n{listing}")
 
@@ -1010,6 +1127,24 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
     sync_chords(treble, temperature, bar_ticks)
     sync_chords(bass, temperature, bar_ticks)
 
+    if max_silent_gap > 0:
+        max_bars = 1 + round(temperature * 7)
+        treble_before = sum(n['f_end'] - n['f_start'] for n in treble)
+        bass_before = sum(n['f_end'] - n['f_start'] for n in bass)
+        fill_small_gaps(treble, max_silent_gap, tie_budget, bar_ticks, max_bars)
+        fill_small_gaps(bass, max_silent_gap, tie_budget, bar_ticks, max_bars)
+        # extension is capped at the next onset, so it can't create an
+        # overlap, but re-sync as a cheap safety net for consistency with
+        # every other duration-mutating step in this pipeline
+        sync_chords(treble, temperature, bar_ticks)
+        sync_chords(bass, temperature, bar_ticks)
+        extended = (sum(n['f_end'] - n['f_start'] for n in treble) - treble_before
+                    + sum(n['f_end'] - n['f_start'] for n in bass) - bass_before) // GRID
+        if extended > 0:
+            print(f"max-silent-gap={max_silent_gap} {GRID_UNIT_NAME} -- closed small rests by "
+                  f"extending notes into them ({extended} {GRID_UNIT_NAME} of rest removed this way)",
+                  file=sys.stderr)
+
     allowance_units = round(temperature * 8 * bar_ticks / GRID)
     print(f"tie-temperature={temperature:.2f}  (max_bars={1 + round(temperature * 7)}, "
           f"tie_budget={1 + round(temperature * 4)}, "
@@ -1054,6 +1189,7 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
 
     out.save(output_path)
     print(f"Saved {output_path}", file=sys.stderr)
+    save_last_paths(input_path, output_path)
 
 
 def _prompt(msg, default=None, cast=str, validate=None):
@@ -1077,6 +1213,15 @@ def _prompt(msg, default=None, cast=str, validate=None):
         return value
 
 
+def _warn(text):
+    """Wrap text in a warning color (yellow) when stdout is an actual
+    terminal; plain text otherwise (piped output, redirected to a file,
+    non-ANSI terminals) so escape codes never corrupt non-interactive use."""
+    if sys.stdout.isatty():
+        return f"\033[33m{text}\033[0m"
+    return text
+
+
 def _prompt_bool(msg, default=False):
     suffix = " [Y/n]" if default else " [y/N]"
     raw = input(f"{msg}{suffix}: ").strip().lower()
@@ -1094,12 +1239,14 @@ def interactive_mode():
     print("=" * 60)
 
     def input_exists(p):
-        import os
         if not os.path.isfile(p):
             return False, f"File not found: {p}"
         return True, None
 
-    input_path = _prompt("Input MIDI file path", validate=input_exists)
+    last = load_last_paths()
+    last_input = last.get('last_input')
+    default_input = last_input if last_input and os.path.isfile(last_input) else None
+    input_path = _prompt("Input MIDI file path", default=default_input, validate=input_exists)
 
     # load the file now so we can suggest data-driven defaults
     mid = MidiFile(input_path)
@@ -1120,20 +1267,28 @@ def interactive_mode():
         if ambiguity:
             print(ambiguity.replace("pass --track N to override", "pick a different track below"))
 
-        def valid_track(t):
-            if 0 <= t < len(mid.tracks):
-                return True, None
-            return False, f"Must be 0-{len(mid.tracks) - 1}."
-        track_idx = _prompt("Note track index", default=auto_track_idx, cast=int, validate=valid_track)
+        def valid_track(s):
+            try:
+                idxs = parse_track_selector(s, len(mid.tracks))
+            except ValueError as e:
+                return False, str(e)
+            bad = [t for t in idxs if not (0 <= t < len(mid.tracks))]
+            if bad:
+                return False, f"Track(s) {bad} out of range -- must be 0-{len(mid.tracks) - 1}."
+            return True, None
+        raw_track = _prompt("Note track index (single, comma-list, or 'all')",
+                             default=str(auto_track_idx), validate=valid_track)
+        track_indices = parse_track_selector(raw_track, len(mid.tracks))
     else:
-        track_idx = auto_track_idx
+        track_indices = [auto_track_idx]
 
     channel_override = None
-    track_channels = track_summary[track_idx][3]
-    if len(track_channels) > 1:
-        print(f"\nTrack {track_idx} carries multiple MIDI channels ({track_channels}) -- "
-              f"if this track merges more than one instrument, pick just one channel, or "
-              f"keep 'all' to use all notes on the track regardless of channel.")
+    # only offer a channel prompt when every selected track actually has >1 channel in use
+    all_channels = sorted(set(ch for t in track_indices for ch in track_summary[t][3]))
+    if len(all_channels) > 1:
+        print(f"\nSelected track(s) carry multiple MIDI channels ({all_channels}) -- "
+              f"if these merge more than one instrument, pick just one channel, or "
+              f"keep 'all' to use all notes regardless of channel.")
 
         def valid_channel(s):
             if s.strip().lower() == 'all':
@@ -1148,16 +1303,21 @@ def interactive_mode():
         raw_channel = _prompt("MIDI channel ('all' or 0-15)", default='all', validate=valid_channel)
         channel_override = None if raw_channel.strip().lower() == 'all' else int(raw_channel)
 
-    notes = extract_notes(mid.tracks[track_idx], channel=channel_override)
+    notes = []
+    for t in track_indices:
+        notes.extend(extract_notes(mid.tracks[t], channel=channel_override))
+    notes.sort(key=lambda n: (n['start'], n['pitch']))
     if not notes:
-        print(f"Error: no notes found on track {track_idx}"
+        print(f"Error: no notes found on track(s) {track_indices}"
               f"{f' channel {channel_override}' if channel_override is not None else ''}.")
         sys.exit(1)
     notes, _ = filter_noise_notes(notes, max(1, GRID // 4))
 
-    import os
     base, _ = os.path.splitext(input_path)
-    default_output = base + "_grandstaff.mid"
+    if last_input and os.path.abspath(last_input) == os.path.abspath(input_path) and last.get('last_output'):
+        default_output = last['last_output']  # same input as last time -- likely re-testing options
+    else:
+        default_output = base + "_grandstaff.mid"
     output_path = _prompt("Output MIDI file path", default=default_output)
 
     detected_tempo, tempo_is_generic = detect_source_tempo(mid)
@@ -1236,6 +1396,7 @@ def interactive_mode():
     min_velocity = 0
     velocity_mode = 'passthrough'
     velocity_scale = 1.0
+    max_silent_gap = 2
     print()
     if _prompt_bool("Show advanced options? (sustain pedal handling, noise filtering, "
                      "triplet/swing grid, duration style, velocity)", default=False):
@@ -1318,10 +1479,29 @@ def interactive_mode():
             velocity_scale = _prompt("Velocity scale factor (e.g. 0.8 softer, 1.3 stronger)",
                                       default=1.0, cast=float, validate=valid_scale)
 
+        print("\nMax silent gap: a note's own release rarely lines up exactly with the")
+        print("                 next note's onset, so a tiny leftover gap becomes a rest.")
+        print("                 Gaps of N grid units or less get closed by extending the")
+        print("                 note instead. Default 2 is conservative.")
+        print(_warn("                 WARNING: raising this is usually NOT the fix you want for "
+                     "\"too many rests\" overall -- at low --tie-temperature (few/no ties allowed), "
+                     "most gaps can't be closed no matter how high you set this, because the "
+                     "extended length has to still fit as a single tie-free notehead. Raising "
+                     "--tie-temperature instead is usually far more effective; use this mainly to "
+                     "mop up genuinely tiny leftover slivers, or set 0 to disable entirely."))
+
+        def valid_gap(v):
+            if v >= 0:
+                return True, None
+            return False, "Must be 0 or greater."
+        max_silent_gap = _prompt("Max silent gap (grid units, 0 = disable)", default=2,
+                                  cast=int, validate=valid_gap)
+
     print()
     run(input_path, output_path, tempo, split_pitch, temperature, time_sig,
-        pedal_mode, min_note_ticks, playback_sustain, grid_mode, track_idx, channel_override,
-        duration_style, min_velocity, velocity_mode, velocity_scale)
+        pedal_mode, min_note_ticks, playback_sustain, grid_mode,
+        ','.join(map(str, track_indices)), channel_override,
+        duration_style, min_velocity, velocity_mode, velocity_scale, max_silent_gap)
 
 
 def main():
@@ -1372,12 +1552,14 @@ def main():
                           'fits both straight and triplet-eighth subdivisions, for pieces with a '
                           'genuine triplet/swing feel that straight-16th quantization would '
                           'otherwise flatten out.')
-    ap.add_argument('--track', type=int, default=None, metavar='N',
+    ap.add_argument('--track', type=str, default=None, metavar='N|N,M,...|all',
                      help='[advanced] use track N (0-indexed) as the note source instead of '
-                          'auto-picking whichever track has the most note_on events -- useful if '
-                          'a multi-instrument source file auto-picks the wrong track. Run once '
-                          'without --track to see the auto-pick and a listing of other tracks in '
-                          'the error message if extraction finds nothing.')
+                          'auto-picking whichever track has the most note_on events. Also '
+                          'accepts a comma-separated list (e.g. "1,2") to merge multiple tracks '
+                          '-- useful for sources with separate right-hand/left-hand tracks -- or '
+                          '"all" to merge every track. Run once without --track to see the '
+                          'auto-pick and a listing of other tracks in the error message if '
+                          'extraction finds nothing.')
     ap.add_argument('--channel', type=int, default=None, metavar='N',
                      help='[advanced] restrict the chosen track to MIDI channel N (0-15) only -- '
                           'useful if a single track merges multiple instruments\' channels '
@@ -1405,6 +1587,14 @@ def main():
     ap.add_argument('--velocity-scale', type=float, default=1.0, metavar='X',
                      help='[advanced] multiplier used by --velocity-mode scale (e.g. 0.8 = '
                           'uniformly softer, 1.3 = uniformly more forceful). Ignored otherwise.')
+    ap.add_argument('--max-silent-gap', type=int, default=2, metavar='N',
+                     help='A note\'s own release time rarely lines up exactly with the next '
+                          'note\'s onset, so the tiny gap between them becomes a rest -- often '
+                          'the dominant source of visual clutter in the output. If that gap is '
+                          '<= N grid units, the note is extended to close it instead of leaving '
+                          'a sliver of a rest (never creates an overlap, never exceeds the tie '
+                          'budget). Default: 2. Use 0 to disable and get the raw, un-extended '
+                          'durations.')
     args = ap.parse_args()
 
     if args.interactive or args.input is None:
@@ -1428,7 +1618,7 @@ def main():
     run(args.input, args.output, args.tempo, args.split_pitch, args.tie_temperature, time_sig,
         args.pedal_mode, args.min_note_ticks, args.playback_sustain == 'on', args.grid,
         args.track, args.channel, args.clean_durations, args.min_velocity,
-        args.velocity_mode, args.velocity_scale)
+        args.velocity_mode, args.velocity_scale, args.max_silent_gap)
 
 
 if __name__ == '__main__':

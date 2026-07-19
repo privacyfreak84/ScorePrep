@@ -87,9 +87,29 @@ have a trustworthy one) is the expected common case.
   blips
 
 ### Robustness
+- **`--max-silent-gap N`** (default 2): the biggest single fix in this
+  release. A note's notated duration previously reflected only its own
+  natural release time, with zero awareness of when the next note
+  starts — so the (often tiny) gap between a note's release and the
+  next onset always became a rest, however small. This was the
+  dominant source of visual clutter, not genuine short rests. Gaps of
+  N grid units or less now extend the note to close them instead,
+  capped so it can never create an overlap or cross a bar temperature
+  says it shouldn't. Set `--max-silent-gap 0` for the old
+  every-gap-is-a-rest behavior. Available in interactive mode's
+  advanced options too, with an explicit warning about when raising it
+  won't actually help (see FAQ).
+- The per-staff report line now prints `rests=N` alongside `needs-tie`
+  — the tie/rest tradeoff was always there, but only half of it was
+  visible before.
 - **`--track` / `--channel`** — manual override for multi-instrument
   source files, with automatic-pick transparency (which track, why,
-  and a warning if another track has a comparable note count)
+  and a warning if another track has a comparable note count).
+  `--track` also accepts a comma-list (`1,2`) or `all` to merge multiple
+  tracks in one pass — useful for sources with separate right-hand/
+  left-hand tracks, instead of processing each one separately
+- **Remembers your last input/output paths** (interactive mode) — no
+  more retyping/pasting the same file paths on every test run
 - **Tempo-ambiguity detection** — when two candidate tempos fit the
   rhythm almost equally well, ScorePrep names both instead of silently
   guessing (this is a fundamental limit of rhythm-only tempo induction,
@@ -149,7 +169,8 @@ python3 scoreprep.py --help
 | `--min-velocity` | Drop notes quieter than this (0–127) as ghost notes |
 | `--velocity-mode {passthrough,normalize,scale}` | Leave velocities alone, remap to a standard range, or scale uniformly |
 | `--velocity-scale` | Multiplier used by `--velocity-mode scale` |
-| `--track N` | Use track N instead of auto-picking |
+| `--track N\|N,M,...\|all` | Use track N, merge several tracks, or merge all tracks, instead of auto-picking |
+| `--max-silent-gap` | Close rests of N grid units or less by extending the previous note; `0` disables |
 | `--channel N` | Restrict the chosen track to one MIDI channel |
 | `--interactive` | Force step-by-step prompts |
 
@@ -157,6 +178,40 @@ Run `scoreprep.py --help` for full, current wording on every flag.
 </details>
 
 ## FAQ
+
+<details>
+<summary>How do I know which --tie-temperature is "best" for my piece?</summary>
+
+There's no universal answer — it's a genuine readability/fidelity
+tradeoff, not something with one correct value. But it's not a pure
+guessing game either: the per-staff report line prints both
+`needs-tie=N` and `rests=N` for every run, so you can compare the
+actual tradeoff numerically across a few values before opening
+anything in MuseScore.
+
+In practice the tradeoff isn't smooth — it tends to have a sharp
+"elbow." Raising `--tie-temperature` a little from `0.0` (try `0.1`)
+often cuts rests substantially at *zero* tie cost, because it mostly
+just relaxes the bar-span cap, not the tie budget itself. Past a
+certain point (often somewhere around `0.15`–`0.2`) the tie budget
+itself increases and `needs-tie` can jump sharply. Try a small sweep
+(`0.0`, `0.1`, `0.2`, `0.3`...), look at where `rests` drops a lot while
+`needs-tie` stays low, and start there.
+</details>
+
+<details>
+<summary>I raised --max-silent-gap but rest count barely changed. Why?</summary>
+
+At a low `--tie-temperature`, the tie budget only allows a note to be
+written as a single, tie-free notehead. Gap-filling can only close a
+gap when the *extended* length still happens to be one of the handful
+of single-notehead-representable durations — most of the time it
+isn't, so the extension is rejected and the rest stays, no matter how
+high the gap threshold is set. Raising `--tie-temperature` itself
+(which relaxes that constraint) is almost always more effective at
+reducing rests than raising `--max-silent-gap` alone; interactive
+mode's advanced options warn about this directly.
+</details>
 
 <details>
 <summary>Why doesn't the estimated tempo always match the original?</summary>
@@ -197,7 +252,6 @@ still sounds like the performance.
 
 Not promising a big list — just what's actively being considered next:
 
-- Way too many rests everywhere in the output pieces currently, must fix this
 - Chord-conflict resolution direction (prefer shortest vs. longest)
 - Same-pitch overlap priority (truncate earlier vs. delay later note)
 - Instrument/channel assignment on output (`program_change`)
@@ -218,6 +272,4 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## License
 
-Not yet licensed for redistribution — personal project, published for
-reference. *(Update this section before publishing publicly if you want
-to allow reuse — e.g. MIT license.)*
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
