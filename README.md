@@ -191,7 +191,7 @@ anything in MuseScore.
 
 In practice the tradeoff isn't smooth — it tends to have a sharp
 "elbow." Raising `--tie-temperature` a little from `0.0` (try `0.1`)
-often cuts rests substantially at *zero* tie cost, because it mostly
+often cuts rests substantially at minimal tie cost, because it mostly
 just relaxes the bar-span cap, not the tie budget itself. Past a
 certain point (often somewhere around `0.15`–`0.2`) the tie budget
 itself increases and `needs-tie` can jump sharply. Try a small sweep
