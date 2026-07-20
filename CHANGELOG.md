@@ -3,6 +3,54 @@
 All notable changes to ScorePrep are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.0]
+
+### Changed
+
+- **Duration engraving redesign.** Replaced the three-pass patch
+  sequence (`resolve_note_durations` snap-down -> `sync_chords` ->
+  `fix_same_pitch_overlaps` -> `sync_chords` -> `fill_small_gaps` ->
+  `sync_chords` again) with a single cost-minimizing optimizer
+  (`optimize_staff_durations`) run once per onset event (a note, or a
+  chord -- every member of an event always gets the same duration, so
+  chords still can't fracture). For each event it picks the duration
+  minimizing `tie_weight * ties + rest_weight * (rest present) +
+  articulation_weight * (grid units of sustain invented beyond the
+  note's real transcribed length)`. `--tie-temperature` still drives
+  all three weights by default (low temperature: avoid ties, cheap to
+  fabricate a small extension to kill a rest; high temperature: ties
+  are free, fabrication is expensive -- fidelity to real timing wins).
+  `sync_chords` and `fill_small_gaps` are gone; their jobs are now
+  built into the one decision instead of patched on afterward.
+- `--max-silent-gap` removed -- superseded by the optimizer's
+  `articulation_weight`, which makes the same tradeoff per-note based
+  on actual cost instead of a single flat threshold.
+- Added `--tie-weight`, `--rest-weight`, `--articulation-weight`
+  (all optional, `[advanced]`) to override any of the three costs
+  individually without touching `--tie-temperature`'s other effects.
+  Available in interactive mode's advanced options as an opt-in
+  override (default: derived from tie-temperature, shown as the
+  suggested value).
+- **Fixed a latent tie-counting gap:** a note spanning a barline needs
+  an extra tied notehead regardless of its duration *value* (MuseScore
+  can't draw one notehead straddling a barline), but `minimal_tie_count`
+  only ever counted ties from the value. This was always technically
+  present, but low-impact under the old algorithm since it never
+  extended a note past its own real length. The new optimizer actively
+  considers extending notes to close rests, including across
+  barlines, which would have made this gap load-bearing. Added
+  `true_tie_count(onset, units, bar_ticks)` (value ties + one per
+  barline crossed) and switched every tie-budget check -- the
+  optimizer, `resolve_note_durations`'s own natural pick,
+  `fix_same_pitch_overlaps`'s re-snap, and the `report()` stats -- to
+  use it. Verified independently (not just via the tool's own stderr
+  report) against real output: 0 tie-budget violations across
+  tie-temperature 0.0-1.0 and time signatures 3/4, 4/4, 5/4, 6/8.
+- Per-staff report now also prints `extended=N (X sixteenths
+  invented)` -- how many notes the optimizer extended past their real
+  transcribed length, and by how much, in one place alongside
+  `needs-tie` and `rests`.
+
 ## [1.1.0]
 
 ### Added

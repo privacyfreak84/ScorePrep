@@ -28,18 +28,20 @@ WHAT THIS SCRIPT DOES
   2. Quantizes note onsets to a 16th-note grid.
   3. Caps every note's duration so it can NEVER cross a barline --
      no more sustained notes tied across many bars.
-  4. Snaps every duration down to the nearest single-notehead-representable
-     value (16th, 8th, dotted 8th, quarter, dotted quarter, half, dotted
-     half, whole...) so no tie chains are needed at all. This trades a bit
-     of exact sustain length for a rest -- readability over millisecond
-     accuracy. A pianist reading "quarter note, rest" where the audio
-     technically rang for 3 bars will just hold the note / use the pedal;
-     they don't need that written out literally.
-  5. Syncs chord members (notes sharing an onset) that disagree on
-     duration to the shortest one, so chords don't fracture into
-     mismatched tied fragments. How much disagreement is tolerated before
-     stepping in scales with tie-temperature (see below).
-  6. Sets the output tempo.
+  4. Picks each note's (or chord's -- notes sharing an onset always get
+     one shared duration, so chords never fracture into mismatched tied
+     fragments) written duration by minimizing a small cost: ties cost,
+     a visible rest costs, and inventing sustain beyond a note's real
+     transcribed length costs. --tie-temperature sets how those three
+     trade off against each other -- low temperature avoids ties almost
+     entirely and prefers a cheap small extension over a rest; high
+     temperature prefers exact fidelity (ties wherever the real timing
+     needs them) over any invented legato. This is deliberately an
+     engraving decision, not just data preservation: a pianist reading
+     "quarter note, rest" where the audio technically rang for 3 bars
+     will just hold the note / use the pedal; they don't need that
+     written out literally.
+  5. Sets the output tempo.
 
 DEFAULTS (auto-estimated when not specified)
 ----------------------------------------------
@@ -171,11 +173,11 @@ GRID_UNIT_NAME = GRID_MODES['straight']['unit_name']
 
 def configure_grid(mode, duration_style='dotted'):
     """Switch the module-level GRID/CLEAN used by every quantization step
-    (quantize, resolve_note_durations, sync_chords, fix_same_pitch_overlaps,
-    minimal_tie_count, ...). mode: 'straight' or 'triplet'. duration_style:
-    'dotted' (default, includes dotted values) or 'powers2' (plain
-    power-of-two note values only). Must be called before any of those
-    run."""
+    (quantize, resolve_note_durations, optimize_staff_durations,
+    fix_same_pitch_overlaps, minimal_tie_count, ...). mode: 'straight' or
+    'triplet'. duration_style: 'dotted' (default, includes dotted values)
+    or 'powers2' (plain power-of-two note values only). Must be called
+    before any of those run."""
     global GRID, CLEAN, GRID_UNIT_NAME
     if mode not in GRID_MODES:
         raise ValueError(f"Unknown grid mode: {mode!r} (expected one of {list(GRID_MODES)})")
@@ -425,25 +427,87 @@ def minimal_tie_count(units):
     return count
 
 
-def best_units_within_budget(raw_units, tie_budget):
-    """Largest duration (in 16th-note units) <= raw_units that can be
-    notated within `tie_budget` tied noteheads. tie_budget=1 means "must
-    be a single clean value" (today's zero-tie default)."""
+def true_tie_count(onset, units, bar_ticks):
+    """Real number of tied noteheads MuseScore needs to render a note of
+    `units` grid-units starting at `onset`: minimal_tie_count's
+    duration-value decomposition, PLUS one extra split for every barline
+    the span crosses -- a single notehead can never be drawn straddling a
+    barline no matter how "clean" its duration value is, and
+    minimal_tie_count alone doesn't know where the barlines are."""
+    end = onset + units * GRID
+    bar_crossings = max(0, (end - 1) // bar_ticks - onset // bar_ticks)
+    return minimal_tie_count(units) + bar_crossings
+
+
+def best_units_within_budget(raw_units, tie_budget, onset=None, bar_ticks=None):
+    """Largest duration (in grid units) <= raw_units that can be notated
+    within `tie_budget` tied noteheads. tie_budget=1 means "must be a
+    single clean value, and must not cross a barline" (today's zero-tie
+    default).
+
+    If onset and bar_ticks are given, ties are counted the accurate way
+    (true_tie_count, including barline crossings). Without them, falls
+    back to duration-value-only counting (minimal_tie_count) -- used by
+    call sites without bar context, where the risk of a fresh crossing is
+    negligible since they only ever shorten an already-valid span."""
     raw_units = max(1, raw_units)
     for candidate in range(raw_units, 0, -1):
-        if minimal_tie_count(candidate) <= tie_budget:
+        tc = (true_tie_count(onset, candidate, bar_ticks) if onset is not None
+              else minimal_tie_count(candidate))
+        if tc <= tie_budget:
             return candidate
     return 1
 
 
-def resolve_note_durations(notes, temperature=0.0, bar_ticks=None):
-    """Quantize onsets, cap duration at a temperature-scaled bar span, and
-    snap to a duration notatable within a temperature-scaled tie budget.
-    Mutates each note dict in place, adding 'f_start' and 'f_end'.
+def optimizer_weights(temperature, tie_weight=None, rest_weight=None, artic_weight=None):
+    """Cost weights for optimize_staff_durations, derived from the single
+    tie-temperature dial by default -- any of the three may be overridden
+    individually via the [advanced] --tie-weight/--rest-weight/
+    --articulation-weight flags for experimentation, without touching code.
 
-    temperature=0.0 -> 1 bar max span, 1 tie link (no ties, max rests)
-    temperature=1.0 -> 8 bar max span, 5 tie links (near-exact original
-                        timing, ties wherever the raw duration needs them)
+    tie_weight   -- cost per extra tied notehead beyond the first. High at
+                     temperature=0 (avoid ties almost entirely -- though
+                     the hard tie_budget already forbids most of this;
+                     this just breaks ties, pun intended, among whatever
+                     the budget still allows), 0 at temperature=1 (ties
+                     become an accepted, unpenalized way to notate exact
+                     timing at max fidelity).
+    rest_weight  -- cost of leaving a visible rest before the next onset.
+                     Held constant: a rest is always somewhat
+                     undesirable, but how willing the optimizer is to
+                     *avoid* one by inventing extra sustain is governed
+                     entirely by articulation_weight below, not this.
+    artic_weight -- cost per grid unit of duration invented beyond a
+                     note's real, evidence-backed sustain (its own
+                     transcribed release, extended by pedal data if
+                     --pedal-mode reflect is on). Low at temperature=0
+                     (cheap to close a small, probably-meaningless gap --
+                     this is what used to be the separate, flat
+                     --max-silent-gap patch), high at temperature=1
+                     (fidelity to the real performance timing is that
+                     setting's whole point, so don't invent legato that
+                     wasn't there -- use a tie instead, which is free at
+                     that end of the dial).
+    """
+    temperature = max(0.0, min(1.0, temperature))
+    return (
+        tie_weight if tie_weight is not None else 6.0 * (1.0 - temperature),
+        rest_weight if rest_weight is not None else 1.0,
+        artic_weight if artic_weight is not None else 0.5 + 2.5 * temperature,
+    )
+
+
+def resolve_note_durations(notes, temperature=0.0, bar_ticks=None):
+    """Quantize onsets and cap each note's *maximum possible* duration at
+    a temperature-scaled bar span and tie budget -- this is the "real
+    evidence" ceiling every later step treats as ground truth. Mutates
+    each note dict in place, adding 'f_start', 'f_end', and 'nat_units'
+    (the natural/evidence-backed duration in grid units -- fixed here and
+    never recomputed later, so later passes always know exactly how much
+    of any given duration is real vs. invented).
+
+    temperature=0.0 -> 1 bar max span, 1 tie link
+    temperature=1.0 -> 8 bar max span, 5 tie links
     """
     if bar_ticks is None:
         bar_ticks = bar_ticks_for(DEFAULT_TIME_SIG)
@@ -462,95 +526,106 @@ def resolve_note_durations(notes, temperature=0.0, bar_ticks=None):
         capped_dur = min(raw_dur, room)
         raw_units = max(1, capped_dur // GRID)
 
-        final_units = best_units_within_budget(raw_units, tie_budget)
+        final_units = best_units_within_budget(raw_units, tie_budget, q_start, bar_ticks)
 
         n['f_start'] = q_start
         n['f_end'] = q_start + final_units * GRID
+        n['nat_units'] = final_units
         # the true/natural sustain end (pre-flooring, pre-bar-cap) -- kept
         # around purely for playback purposes later; never used for the
         # notated duration itself
         n['natural_end'] = max(n['f_end'], raw_end)
 
 
-def sync_chords(notes, temperature=0.0, bar_ticks=None):
-    """Notes sharing an onset (a chord) ideally share one duration, to
-    avoid fracturing into mismatched tied fragments. How much mismatch is
-    tolerated before forcing them together scales continuously with
-    temperature:
+def optimize_staff_durations(notes, temperature, bar_ticks, weights=None):
+    """The core engraving decision for one staff, run after
+    resolve_note_durations has already established each note's hard
+    ceiling (bar-span cap, tie-budget cap, 'nat_units' = real evidence).
 
-    temperature=0.0 -> allowance=0: ANY mismatch gets force-synced to the
-                        shortest member (biases toward a rest over a
-                        fractured chord). Matches the strict default.
-    temperature=1.0 -> allowance=8 bars: bigger than any single note could
-                        ever span, so mismatches are effectively never
-                        forced -- matches "closest fidelity" behavior,
-                        chords allowed to fracture if the data disagrees.
+    Replaces the old three-pass patch sequence (sync_chords ->
+    fix_same_pitch_overlaps -> sync_chords again -> fill_small_gaps ->
+    sync_chords again) with a single cost-minimizing choice per onset
+    event (one note, or every note sharing that onset -- a chord).
 
-    Values in between tolerate proportionally larger mismatches before
-    stepping in, rather than the old hard on/off switch at 0.5.
+    For every event, picks the ONE written duration -- applied to every
+    member of the event, so chords share a duration by construction and
+    can never fracture into mismatched tied fragments -- that minimizes:
+
+        tie_weight   * (extra tied noteheads beyond the first)
+      + rest_weight  * (1 if a rest remains before the next onset) * (event size)
+      + artic_weight * (grid units of duration invented beyond each
+                         member's own real, evidence-backed 'nat_units' --
+                         i.e. how much unproven legato we'd be claiming)
+
+    Candidates are still hard-bounded by the same tie_budget
+    resolve_note_durations used (so "never need more ties than the chosen
+    temperature allows" holds exactly as before) and can never extend
+    into another note of the SAME pitch (preserves genuine cross-pitch
+    polyphony within a staff -- a real sustained note under a moving
+    line -- which was always left untouched on purpose; only actual
+    same-pitch retriggers are a hard constraint). Mutates 'f_end' in
+    place; leaves 'nat_units'/'natural_end' untouched so later passes
+    (and playback-sustain) still see the true evidence.
     """
-    if bar_ticks is None:
-        bar_ticks = bar_ticks_for(DEFAULT_TIME_SIG)
-    temperature = max(0.0, min(1.0, temperature))
-    allowance = temperature * 8 * bar_ticks
+    if not notes:
+        return
+    if weights is None:
+        weights = optimizer_weights(temperature)
+    tie_w, rest_w, artic_w = weights
+    tie_budget = tie_budget_for(temperature)
+    max_bars = 1 + round(max(0.0, min(1.0, temperature)) * 7)
+
+    onsets = sorted(set(n['f_start'] for n in notes))
+    next_onset_after = {a: b for a, b in zip(onsets, onsets[1:])}
+
+    by_pitch = defaultdict(list)
+    for n in notes:
+        by_pitch[n['pitch']].append(n['f_start'])
+    next_same_pitch = {}
+    for pitch, starts in by_pitch.items():
+        starts = sorted(set(starts))
+        for a, b in zip(starts, starts[1:]):
+            next_same_pitch[(pitch, a)] = b
 
     by_onset = defaultdict(list)
     for n in notes:
         by_onset[n['f_start']].append(n)
-    for onset, chord in by_onset.items():
-        if len(chord) < 2:
-            continue
-        ends = [n['f_end'] for n in chord]
-        if max(ends) - min(ends) <= allowance:
-            continue
-        min_end = min(ends)
-        for n in chord:
-            n['f_end'] = min_end
 
+    for onset, event in by_onset.items():
+        bar_start = (onset // bar_ticks) * bar_ticks
+        bar_room_units = max(1, (bar_start + max_bars * bar_ticks - onset) // GRID)
+        next_onset = next_onset_after.get(onset)
+        next_onset_units = ((next_onset - onset) // GRID) if next_onset is not None else None
 
-def fill_small_gaps(notes, max_gap_units, tie_budget, bar_ticks, max_bars):
-    """A note's notated duration (from resolve_note_durations) reflects
-    only its own natural release time -- it has no awareness of when the
-    next note starts. In a transcription, a note's release almost never
-    lines up exactly with the next onset, so the gap between them becomes
-    a rest -- often a single grid unit or less, which is the dominant
-    source of rest clutter in the output (much more so than genuine
-    intentional short rests).
+        ceiling = bar_room_units
+        member_nat_units = []
+        for n in event:
+            same_pitch_next = next_same_pitch.get((n['pitch'], onset))
+            member_ceiling = bar_room_units
+            if same_pitch_next is not None:
+                member_ceiling = min(member_ceiling, max(1, (same_pitch_next - onset) // GRID))
+            ceiling = min(ceiling, member_ceiling)
+            member_nat_units.append(n['nat_units'])
 
-    If that gap is small (<= max_gap_units grid units), extend the note
-    to close it instead of leaving a sliver of a rest. The extension is
-    capped at whichever is smaller: the next onset in this staff (never
-    creates an overlap), or the same temperature-scaled bar-span room
-    resolve_note_durations itself enforces (so temperature=0.0 still
-    keeps notes within their own bar, exactly as before -- this pass
-    must not reintroduce cross-bar spans that setting was meant to
-    prevent). The resulting duration is re-snapped with
-    best_units_within_budget, so it can only partially close the gap (or
-    not at all) rather than ever exceeding the tie budget -- never worse
-    than leaving the rest. Mutates 'f_end' in place. Chord members
-    sharing an onset extend to the same new length by construction, so
-    this can't refracture a chord sync_chords already unified."""
-    if max_gap_units <= 0 or not notes:
-        return
-    onsets = sorted(set(n['f_start'] for n in notes))
-    next_onset_after = {a: b for a, b in zip(onsets, onsets[1:])}
-    for n in notes:
-        nxt = next_onset_after.get(n['f_start'])
-        if nxt is None:
-            continue
-        gap = nxt - n['f_end']
-        if gap <= 0 or gap > max_gap_units * GRID:
-            continue
-        bar_start = (n['f_start'] // bar_ticks) * bar_ticks
-        room = bar_start + max_bars * bar_ticks - n['f_start']
-        target_units = min(nxt - n['f_start'], room) // GRID
-        final_units = best_units_within_budget(target_units, tie_budget)
-        new_end = n['f_start'] + final_units * GRID
-        if new_end > n['f_end']:
+        best_v, best_cost, best_fab = 1, None, None
+        for v in range(1, ceiling + 1):
+            tc = true_tie_count(onset, v, bar_ticks)
+            if tc > tie_budget:
+                continue
+            rest_present = next_onset_units is not None and v < next_onset_units
+            fabrication = sum(max(0, v - nat) for nat in member_nat_units)
+            cost = (tie_w * (tc - 1)
+                    + rest_w * (len(event) if rest_present else 0)
+                    + artic_w * fabrication)
+            if best_cost is None or cost < best_cost or (cost == best_cost and fabrication < best_fab):
+                best_v, best_cost, best_fab = v, cost, fabrication
+
+        new_end = onset + best_v * GRID
+        for n in event:
             n['f_end'] = new_end
 
 
-def fix_same_pitch_overlaps(notes, tie_budget=1):
+def fix_same_pitch_overlaps(notes, tie_budget=1, bar_ticks=None):
     """Prevent a pitch's note-off happening after the next note-on of the
     same pitch (can happen after rounding).
 
@@ -559,7 +634,8 @@ def fix_same_pitch_overlaps(notes, tie_budget=1):
     -- left alone, that can silently need more tied noteheads than the
     requested tie_budget allows (invisible until something actually counts
     ties). So after truncating, re-snap down to the largest duration that
-    still respects tie_budget; this can only shorten further, so it can't
+    still respects tie_budget (accounting for barline crossings when
+    bar_ticks is given); this can only shorten further, so it can't
     reopen the overlap just fixed."""
     by_pitch = defaultdict(list)
     for n in notes:
@@ -570,7 +646,7 @@ def fix_same_pitch_overlaps(notes, tie_budget=1):
             if lst[i]['f_end'] > lst[i + 1]['f_start']:
                 start = lst[i]['f_start']
                 truncated_units = max(1, (lst[i + 1]['f_start'] - start) // GRID)
-                final_units = best_units_within_budget(truncated_units, tie_budget)
+                final_units = best_units_within_budget(truncated_units, tie_budget, start, bar_ticks)
                 lst[i]['f_end'] = start + final_units * GRID
 
 
@@ -899,7 +975,8 @@ def estimate_split_pitch(notes, fallback=SPLIT_PITCH):
 
 
 def report(name, notes, bar_ticks):
-    tie_counts = [minimal_tie_count((n['f_end'] - n['f_start']) // GRID) for n in notes]
+    tie_counts = [true_tie_count(n['f_start'], (n['f_end'] - n['f_start']) // GRID, bar_ticks)
+                  for n in notes]
     needs_tie = sum(1 for c in tie_counts if c > 1)
     max_ties = max(tie_counts) if tie_counts else 0
     cross_bar = sum(1 for n in notes if (n['f_start'] // bar_ticks) != ((n['f_end'] - 1) // bar_ticks))
@@ -911,14 +988,18 @@ def report(name, notes, bar_ticks):
     next_onset_after = {a: b for a, b in zip(onsets, onsets[1:])}
     rests = sum(1 for n in notes
                 if (nxt := next_onset_after.get(n['f_start'])) is not None and nxt - n['f_end'] > 0)
+    fab_units = sum(max(0, (n['f_end'] - n['f_start']) // GRID - n.get('nat_units', 0)) for n in notes)
+    extended = sum(1 for n in notes if (n['f_end'] - n['f_start']) // GRID > n.get('nat_units', 0))
     print(f"  {name}: {len(notes)} notes | needs-tie={needs_tie} (max chain={max_ties}) rests={rests} "
-          f"cross-bar={cross_bar} chord-conflicts={conflicts}", file=sys.stderr)
+          f"cross-bar={cross_bar} chord-conflicts={conflicts} extended={extended} "
+          f"({fab_units} {GRID_UNIT_NAME} invented)", file=sys.stderr)
 
 
 def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
         pedal_mode='ignore', min_note_ticks=None, playback_sustain=True, grid_mode='straight',
         track_selector=None, channel_override=None, duration_style='dotted',
-        min_velocity=0, velocity_mode='passthrough', velocity_scale=1.0, max_silent_gap=2):
+        min_velocity=0, velocity_mode='passthrough', velocity_scale=1.0,
+        tie_weight=None, rest_weight=None, artic_weight=None):
     """Runs the full cleanup pipeline. Shared by --interactive and normal
     CLI-argument mode. tempo, split_pitch, and time_sig may be None, in
     which case they're estimated from the source file."""
@@ -1114,42 +1195,23 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
     treble = [n for n in notes if n['pitch'] >= split_pitch]
     bass = [n for n in notes if n['pitch'] < split_pitch]
 
-    sync_chords(treble, temperature, bar_ticks)
-    sync_chords(bass, temperature, bar_ticks)
     tie_budget = tie_budget_for(temperature)
-    fix_same_pitch_overlaps(treble, tie_budget)
-    fix_same_pitch_overlaps(bass, tie_budget)
+    weights = optimizer_weights(temperature, tie_weight, rest_weight, artic_weight)
+    optimize_staff_durations(treble, temperature, bar_ticks, weights)
+    optimize_staff_durations(bass, temperature, bar_ticks, weights)
+    fix_same_pitch_overlaps(treble, tie_budget, bar_ticks)
+    fix_same_pitch_overlaps(bass, tie_budget, bar_ticks)
     # fixing a same-pitch overlap can shorten just one member of a chord
-    # that sync_chords already made uniform -- re-sync once more to close
-    # that gap. Since this second pass can only ever shorten notes
+    # the optimizer already made uniform -- re-harmonize once more to
+    # close that gap. Since this second pass can only ever shorten notes
     # further (never lengthen), it can't reopen any overlap the previous
     # step just fixed, so one extra pass is sufficient.
-    sync_chords(treble, temperature, bar_ticks)
-    sync_chords(bass, temperature, bar_ticks)
+    optimize_staff_durations(treble, temperature, bar_ticks, weights)
+    optimize_staff_durations(bass, temperature, bar_ticks, weights)
 
-    if max_silent_gap > 0:
-        max_bars = 1 + round(temperature * 7)
-        treble_before = sum(n['f_end'] - n['f_start'] for n in treble)
-        bass_before = sum(n['f_end'] - n['f_start'] for n in bass)
-        fill_small_gaps(treble, max_silent_gap, tie_budget, bar_ticks, max_bars)
-        fill_small_gaps(bass, max_silent_gap, tie_budget, bar_ticks, max_bars)
-        # extension is capped at the next onset, so it can't create an
-        # overlap, but re-sync as a cheap safety net for consistency with
-        # every other duration-mutating step in this pipeline
-        sync_chords(treble, temperature, bar_ticks)
-        sync_chords(bass, temperature, bar_ticks)
-        extended = (sum(n['f_end'] - n['f_start'] for n in treble) - treble_before
-                    + sum(n['f_end'] - n['f_start'] for n in bass) - bass_before) // GRID
-        if extended > 0:
-            print(f"max-silent-gap={max_silent_gap} {GRID_UNIT_NAME} -- closed small rests by "
-                  f"extending notes into them ({extended} {GRID_UNIT_NAME} of rest removed this way)",
-                  file=sys.stderr)
-
-    allowance_units = round(temperature * 8 * bar_ticks / GRID)
     print(f"tie-temperature={temperature:.2f}  (max_bars={1 + round(temperature * 7)}, "
-          f"tie_budget={1 + round(temperature * 4)}, "
-          f"chord_sync_allowance={allowance_units} {GRID_UNIT_NAME})",
-          file=sys.stderr)
+          f"tie_budget={tie_budget}, weights: tie={weights[0]:.2f} rest={weights[1]:.2f} "
+          f"articulation={weights[2]:.2f})", file=sys.stderr)
     print(f"Processed {len(notes)} notes -> treble {len(treble)}, bass {len(bass)}", file=sys.stderr)
     report('TREBLE', treble, bar_ticks)
     report('BASS', bass, bar_ticks)
@@ -1396,7 +1458,7 @@ def interactive_mode():
     min_velocity = 0
     velocity_mode = 'passthrough'
     velocity_scale = 1.0
-    max_silent_gap = 2
+    tie_weight = rest_weight = artic_weight = None
     print()
     if _prompt_bool("Show advanced options? (sustain pedal handling, noise filtering, "
                      "triplet/swing grid, duration style, velocity)", default=False):
@@ -1479,29 +1541,28 @@ def interactive_mode():
             velocity_scale = _prompt("Velocity scale factor (e.g. 0.8 softer, 1.3 stronger)",
                                       default=1.0, cast=float, validate=valid_scale)
 
-        print("\nMax silent gap: a note's own release rarely lines up exactly with the")
-        print("                 next note's onset, so a tiny leftover gap becomes a rest.")
-        print("                 Gaps of N grid units or less get closed by extending the")
-        print("                 note instead. Default 2 is conservative.")
-        print(_warn("                 WARNING: raising this is usually NOT the fix you want for "
-                     "\"too many rests\" overall -- at low --tie-temperature (few/no ties allowed), "
-                     "most gaps can't be closed no matter how high you set this, because the "
-                     "extended length has to still fit as a single tie-free notehead. Raising "
-                     "--tie-temperature instead is usually far more effective; use this mainly to "
-                     "mop up genuinely tiny leftover slivers, or set 0 to disable entirely."))
-
-        def valid_gap(v):
-            if v >= 0:
-                return True, None
-            return False, "Must be 0 or greater."
-        max_silent_gap = _prompt("Max silent gap (grid units, 0 = disable)", default=2,
-                                  cast=int, validate=valid_gap)
+        default_tie_w, default_rest_w, default_artic_w = optimizer_weights(temperature)
+        print(f"\nDuration optimizer weights: every note's written length is chosen to "
+              f"minimize a cost of (ties + rests + invented sustain). --tie-temperature above "
+              f"already sets sensible values for these ({default_tie_w:.2f} / "
+              f"{default_rest_w:.2f} / {default_artic_w:.2f}) -- only override if you want to "
+              f"tune the tradeoff directly.")
+        if _prompt_bool("Override the optimizer weights individually?", default=False):
+            tie_weight = _prompt("Tie weight (cost per extra tied notehead)",
+                                  default=default_tie_w, cast=float)
+            rest_weight = _prompt("Rest weight (cost of leaving a visible rest)",
+                                   default=default_rest_w, cast=float)
+            artic_weight = _prompt("Articulation weight (cost per grid unit of invented sustain)",
+                                    default=default_artic_w, cast=float)
+        else:
+            tie_weight = rest_weight = artic_weight = None
 
     print()
     run(input_path, output_path, tempo, split_pitch, temperature, time_sig,
         pedal_mode, min_note_ticks, playback_sustain, grid_mode,
         ','.join(map(str, track_indices)), channel_override,
-        duration_style, min_velocity, velocity_mode, velocity_scale, max_silent_gap)
+        duration_style, min_velocity, velocity_mode, velocity_scale,
+        tie_weight, rest_weight, artic_weight)
 
 
 def main():
@@ -1587,14 +1648,18 @@ def main():
     ap.add_argument('--velocity-scale', type=float, default=1.0, metavar='X',
                      help='[advanced] multiplier used by --velocity-mode scale (e.g. 0.8 = '
                           'uniformly softer, 1.3 = uniformly more forceful). Ignored otherwise.')
-    ap.add_argument('--max-silent-gap', type=int, default=2, metavar='N',
-                     help='A note\'s own release time rarely lines up exactly with the next '
-                          'note\'s onset, so the tiny gap between them becomes a rest -- often '
-                          'the dominant source of visual clutter in the output. If that gap is '
-                          '<= N grid units, the note is extended to close it instead of leaving '
-                          'a sliver of a rest (never creates an overlap, never exceeds the tie '
-                          'budget). Default: 2. Use 0 to disable and get the raw, un-extended '
-                          'durations.')
+    ap.add_argument('--tie-weight', type=float, default=None, metavar='X',
+                     help='[advanced] override the duration optimizer\'s cost per extra tied '
+                          'notehead (higher = more tie-averse). Default: derived from '
+                          '--tie-temperature.')
+    ap.add_argument('--rest-weight', type=float, default=None, metavar='X',
+                     help='[advanced] override the duration optimizer\'s cost for leaving a '
+                          'visible rest before the next note. Default: 1.0.')
+    ap.add_argument('--articulation-weight', type=float, default=None, metavar='X',
+                     help='[advanced] override the duration optimizer\'s cost per grid unit of '
+                          'sustain invented beyond a note\'s real transcribed length (higher = '
+                          'more faithful to real note-off timing and less willing to fabricate '
+                          'legato to close a rest). Default: derived from --tie-temperature.')
     args = ap.parse_args()
 
     if args.interactive or args.input is None:
@@ -1618,7 +1683,8 @@ def main():
     run(args.input, args.output, args.tempo, args.split_pitch, args.tie_temperature, time_sig,
         args.pedal_mode, args.min_note_ticks, args.playback_sustain == 'on', args.grid,
         args.track, args.channel, args.clean_durations, args.min_velocity,
-        args.velocity_mode, args.velocity_scale, args.max_silent_gap)
+        args.velocity_mode, args.velocity_scale,
+        args.tie_weight, args.rest_weight, args.articulation_weight)
 
 
 if __name__ == '__main__':

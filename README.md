@@ -87,21 +87,29 @@ have a trustworthy one) is the expected common case.
   blips
 
 ### Robustness
-- **`--max-silent-gap N`** (default 2): the biggest single fix in this
-  release. A note's notated duration previously reflected only its own
-  natural release time, with zero awareness of when the next note
-  starts — so the (often tiny) gap between a note's release and the
-  next onset always became a rest, however small. This was the
-  dominant source of visual clutter, not genuine short rests. Gaps of
-  N grid units or less now extend the note to close them instead,
-  capped so it can never create an overlap or cross a bar temperature
-  says it shouldn't. Set `--max-silent-gap 0` for the old
-  every-gap-is-a-rest behavior. Available in interactive mode's
-  advanced options too, with an explicit warning about when raising it
-  won't actually help (see FAQ).
-- The per-staff report line now prints `rests=N` alongside `needs-tie`
-  — the tie/rest tradeoff was always there, but only half of it was
-  visible before.
+- **Cost-based duration optimizer** — the biggest change in this
+  release. Every note's (or chord's) written duration used to be chosen
+  in three separate bolted-on passes (snap-to-largest-value, then force
+  chord members to agree, then a flat-threshold gap-filler) — three
+  patches for what's really one decision. It's now one pass that picks
+  the duration minimizing a small cost: ties cost, a visible rest costs,
+  and inventing sustain beyond a note's real transcribed length costs.
+  `--tie-temperature` sets how those trade off — low temperature avoids
+  ties almost entirely and prefers a cheap small extension over a rest;
+  high temperature prefers exact fidelity (ties wherever the real timing
+  needs them) over any invented legato. The three weights
+  (`--tie-weight`, `--rest-weight`, `--articulation-weight`) can be
+  overridden individually if you want to tune the tradeoff directly
+  instead of through the single dial.
+- The per-staff report line now prints `rests=N` and `extended=N (X
+  sixteenths invented)` alongside `needs-tie` — both halves of the
+  tie/rest tradeoff, plus exactly how much sustain the optimizer
+  fabricated to get there, visible in one place.
+- **Barline-aware tie counting** — a note spanning a barline needs an
+  extra tied notehead no matter how "clean" its duration value is
+  (MuseScore can't draw one notehead straddling a barline). Every
+  tie-budget check now accounts for this, so `needs-tie` and the
+  optimizer's own decisions are never off by an uncounted tie.
 - **`--track` / `--channel`** — manual override for multi-instrument
   source files, with automatic-pick transparency (which track, why,
   and a warning if another track has a comparable note count).
@@ -170,7 +178,9 @@ python3 scoreprep.py --help
 | `--velocity-mode {passthrough,normalize,scale}` | Leave velocities alone, remap to a standard range, or scale uniformly |
 | `--velocity-scale` | Multiplier used by `--velocity-mode scale` |
 | `--track N\|N,M,...\|all` | Use track N, merge several tracks, or merge all tracks, instead of auto-picking |
-| `--max-silent-gap` | Close rests of N grid units or less by extending the previous note; `0` disables |
+| `--tie-weight` | [advanced] override the optimizer's cost per extra tied notehead. Default: derived from `--tie-temperature` |
+| `--rest-weight` | [advanced] override the optimizer's cost for leaving a visible rest. Default: `1.0` |
+| `--articulation-weight` | [advanced] override the optimizer's cost per grid unit of invented sustain. Default: derived from `--tie-temperature` |
 | `--channel N` | Restrict the chosen track to one MIDI channel |
 | `--interactive` | Force step-by-step prompts |
 
@@ -200,17 +210,18 @@ itself increases and `needs-tie` can jump sharply. Try a small sweep
 </details>
 
 <details>
-<summary>I raised --max-silent-gap but rest count barely changed. Why?</summary>
+<summary>I want fewer rests but --tie-temperature also adds ties I don't want. Why can't I control these separately?</summary>
 
-At a low `--tie-temperature`, the tie budget only allows a note to be
-written as a single, tie-free notehead. Gap-filling can only close a
-gap when the *extended* length still happens to be one of the handful
-of single-notehead-representable durations — most of the time it
-isn't, so the extension is rejected and the rest stays, no matter how
-high the gap threshold is set. Raising `--tie-temperature` itself
-(which relaxes that constraint) is almost always more effective at
-reducing rests than raising `--max-silent-gap` alone; interactive
-mode's advanced options warn about this directly.
+You can — `--rest-weight` and `--articulation-weight` (and `--tie-weight`)
+override the three costs the duration optimizer balances individually,
+without touching `--tie-temperature`'s other effects (bar-span cap,
+chord-sync tolerance). Lower `--articulation-weight` to make the
+optimizer more willing to invent sustain and close rests without adding
+ties; raise `--rest-weight` if you'd rather leave rests than fabricate
+anything. These are deliberately a bit hidden (not the first thing
+`--help` shows) since `--tie-temperature` alone is enough for most
+pieces — reach for the individual weights only once you've found the
+single dial isn't giving you the specific tradeoff you want.
 </details>
 
 <details>
