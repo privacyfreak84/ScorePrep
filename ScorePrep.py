@@ -547,25 +547,35 @@ def optimize_staff_durations(notes, temperature, bar_ticks, weights=None):
     sync_chords again) with a single cost-minimizing choice per onset
     event (one note, or every note sharing that onset -- a chord).
 
-    For every event, picks the ONE written duration -- applied to every
-    member of the event, so chords share a duration by construction and
-    can never fracture into mismatched tied fragments -- that minimizes:
+    Every event first gets its truthful baseline: the longest duration
+    representable within the tie budget that's still <= each member's
+    real evidence ('nat_units', from resolve_note_durations) -- i.e.
+    exactly what the old algorithm always did, maximizing truthful
+    length within budget, no cost attached. A genuinely long real note
+    that needs 2 ties to notate accurately keeps those 2 ties for free;
+    ties are never a reason to truncate real data.
 
-        tie_weight   * (extra tied noteheads beyond the first)
+    From that baseline, extending further (to close a rest) is then
+    optionally considered, and THAT is where cost applies -- only ties
+    spent on top of the baseline, plus any invented (unevidenced)
+    sustain, are weighed against the rest they'd remove:
+
+        tie_weight   * (ties beyond what the truthful baseline already needs)
       + rest_weight  * (1 if a rest remains before the next onset) * (event size)
       + artic_weight * (grid units of duration invented beyond each
-                         member's own real, evidence-backed 'nat_units' --
-                         i.e. how much unproven legato we'd be claiming)
+                         member's own real, evidence-backed 'nat_units')
 
-    Candidates are still hard-bounded by the same tie_budget
-    resolve_note_durations used (so "never need more ties than the chosen
-    temperature allows" holds exactly as before) and can never extend
-    into another note of the SAME pitch (preserves genuine cross-pitch
-    polyphony within a staff -- a real sustained note under a moving
-    line -- which was always left untouched on purpose; only actual
-    same-pitch retriggers are a hard constraint). Mutates 'f_end' in
-    place; leaves 'nat_units'/'natural_end' untouched so later passes
-    (and playback-sustain) still see the true evidence.
+    Never searches below the truthful baseline -- there's no scenario
+    where truncating a real note below its own evidence-backed,
+    budget-respecting length is ever the right call. Candidates are
+    still hard-bounded by the same tie_budget resolve_note_durations
+    used, and can never extend into another note of the SAME pitch
+    (preserves genuine cross-pitch polyphony within a staff -- a real
+    sustained note under a moving line -- which was always left
+    untouched on purpose; only actual same-pitch retriggers are a hard
+    constraint). Mutates 'f_end' in place; leaves 'nat_units'/
+    'natural_end' untouched so later passes (and playback-sustain)
+    still see the true evidence.
     """
     if not notes:
         return
@@ -607,14 +617,23 @@ def optimize_staff_durations(notes, temperature, bar_ticks, weights=None):
             ceiling = min(ceiling, member_ceiling)
             member_nat_units.append(n['nat_units'])
 
-        best_v, best_cost, best_fab = 1, None, None
-        for v in range(1, ceiling + 1):
+        # truthful baseline: longest duration <= each member's real evidence,
+        # still within the tie budget -- shortest member wins for a chord (so
+        # no member's real length is ever overstated), matching the old
+        # "force chord to shortest" default behavior.
+        baseline = min(best_units_within_budget(nat, tie_budget, onset, bar_ticks)
+                        for nat in member_nat_units)
+        baseline = min(baseline, ceiling)
+        baseline_tc = true_tie_count(onset, baseline, bar_ticks)
+
+        best_v, best_cost, best_fab = baseline, None, None
+        for v in range(baseline, ceiling + 1):
             tc = true_tie_count(onset, v, bar_ticks)
             if tc > tie_budget:
                 continue
             rest_present = next_onset_units is not None and v < next_onset_units
             fabrication = sum(max(0, v - nat) for nat in member_nat_units)
-            cost = (tie_w * (tc - 1)
+            cost = (tie_w * max(0, tc - baseline_tc)
                     + rest_w * (len(event) if rest_present else 0)
                     + artic_w * fabrication)
             if best_cost is None or cost < best_cost or (cost == best_cost and fabrication < best_fab):

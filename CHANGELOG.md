@@ -3,6 +3,28 @@
 All notable changes to ScorePrep are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Optimizer was truncating genuinely long real notes to dodge ties.**
+  The v1.2 cost model charged `tie_weight` for every tie a note needed,
+  including ties required just to truthfully notate a real, long,
+  evidence-backed note (zero fabrication involved). Since a single tie
+  usually cost more than leaving a rest, the optimizer was chopping real
+  sustained notes down to one short notehead + a big rest -- discarding
+  real transcription data, and undoing exactly what tie-temperature was
+  supposed to allow. Ties needed for a note's truthful,
+  tie-budget-respecting length are now free (matching the pre-1.2
+  behavior of always maximizing real length within budget); only ties
+  spent *beyond* that truthful baseline -- i.e. fabricating extra
+  sustain to close a rest -- carry a cost now. On a real 1271-note
+  test file at tie-temperature=0.25: `needs-tie` went from 0/0 to
+  406/360 (treble/bass) and `rests` dropped from 159/274 to 62/104.
+  Re-verified: full regression suite, and the tie-budget/barline
+  invariant independently re-checked across both test files, four time
+  signatures, and the full temperature range -- zero violations.
+
 ## [1.2.0]
 
 ### Changed

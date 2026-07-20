@@ -92,15 +92,20 @@ have a trustworthy one) is the expected common case.
   in three separate bolted-on passes (snap-to-largest-value, then force
   chord members to agree, then a flat-threshold gap-filler) — three
   patches for what's really one decision. It's now one pass that picks
-  the duration minimizing a small cost: ties cost, a visible rest costs,
-  and inventing sustain beyond a note's real transcribed length costs.
-  `--tie-temperature` sets how those trade off — low temperature avoids
-  ties almost entirely and prefers a cheap small extension over a rest;
-  high temperature prefers exact fidelity (ties wherever the real timing
-  needs them) over any invented legato. The three weights
-  (`--tie-weight`, `--rest-weight`, `--articulation-weight`) can be
-  overridden individually if you want to tune the tradeoff directly
-  instead of through the single dial.
+  the duration minimizing a small cost. Every note first gets its
+  truthful baseline: the longest duration representable within the tie
+  budget that's still within its own real, transcribed length — ties
+  needed to notate that truthfully are always free, never traded away
+  (a genuinely long, pedal-sustained note keeps its ties regardless of
+  weights). *From* that baseline, extending further to close a rest is
+  then optionally considered, weighing the ties and invented sustain
+  it would cost against the rest it would remove.
+  `--tie-temperature` sets how that extension decision trades off — low
+  temperature prefers a cheap small extension over a rest; high
+  temperature prefers leaving the rest over any invented legato. The
+  three weights (`--tie-weight`, `--rest-weight`,
+  `--articulation-weight`) can be overridden individually if you want
+  to tune the tradeoff directly instead of through the single dial.
 - The per-staff report line now prints `rests=N` and `extended=N (X
   sixteenths invented)` alongside `needs-tie` — both halves of the
   tie/rest tradeoff, plus exactly how much sustain the optimizer
