@@ -3,7 +3,7 @@
 All notable changes to ScorePrep are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [1.2.1]
 
 ### Fixed
 
