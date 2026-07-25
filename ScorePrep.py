@@ -994,10 +994,18 @@ def estimate_split_pitch(notes, fallback=SPLIT_PITCH):
 
 
 def report(name, notes, bar_ticks):
+    """Pure diagnostic pass over already-finalized notes -- reads f_start/
+    f_end/nat_units, mutates nothing, so restructuring this has zero effect
+    on the actual engraving decisions made upstream."""
     tie_counts = [true_tie_count(n['f_start'], (n['f_end'] - n['f_start']) // GRID, bar_ticks)
                   for n in notes]
-    needs_tie = sum(1 for c in tie_counts if c > 1)
-    max_ties = max(tie_counts) if tie_counts else 0
+    # true_tie_count returns notehead count (a plain untied note is 1 notehead,
+    # not 0) -- actual tie count is noteheads - 1.
+    ties = [c - 1 for c in tie_counts]
+    tie_0 = sum(1 for t in ties if t == 0)
+    tie_1 = sum(1 for t in ties if t == 1)
+    tie_2plus = sum(1 for t in ties if t >= 2)
+    max_ties = max(ties) if ties else 0
     cross_bar = sum(1 for n in notes if (n['f_start'] // bar_ticks) != ((n['f_end'] - 1) // bar_ticks))
     by_onset = defaultdict(set)
     for n in notes:
@@ -1009,9 +1017,19 @@ def report(name, notes, bar_ticks):
                 if (nxt := next_onset_after.get(n['f_start'])) is not None and nxt - n['f_end'] > 0)
     fab_units = sum(max(0, (n['f_end'] - n['f_start']) // GRID - n.get('nat_units', 0)) for n in notes)
     extended = sum(1 for n in notes if (n['f_end'] - n['f_start']) // GRID > n.get('nat_units', 0))
-    print(f"  {name}: {len(notes)} notes | needs-tie={needs_tie} (max chain={max_ties}) rests={rests} "
-          f"cross-bar={cross_bar} chord-conflicts={conflicts} extended={extended} "
-          f"({fab_units} {GRID_UNIT_NAME} invented)", file=sys.stderr)
+
+    print(f"\n===== Notation ({name}) =====", file=sys.stderr)
+    print(f"Notes:                {len(notes)}", file=sys.stderr)
+    print(f"Tie chains -- none: {tie_0}  one tie: {tie_1}  two+ ties: {tie_2plus}  "
+          f"(longest chain: {max_ties})", file=sys.stderr)
+    print(f"Cross-bar ties:       {cross_bar}", file=sys.stderr)
+    print(f"Rests introduced:     {rests}", file=sys.stderr)
+    print(f"Chord conflicts:      {conflicts}", file=sys.stderr)
+    if extended:
+        print(f"Invented sustain:     {extended} note(s), {fab_units} {GRID_UNIT_NAME} total",
+              file=sys.stderr)
+    else:
+        print(f"Invented sustain:     none needed at this tie-temperature", file=sys.stderr)
 
 
 def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
@@ -1238,6 +1256,7 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
     print(f"tie-temperature={temperature:.2f}  (max_bars={1 + round(temperature * 7)}, "
           f"tie_budget={tie_budget}, weights: tie={weights[0]:.2f} rest={weights[1]:.2f} "
           f"articulation={weights[2]:.2f})", file=sys.stderr)
+    print(f"\n===== Staff Split =====", file=sys.stderr)
     print(f"Processed {len(notes)} notes -> treble {len(treble)}, bass {len(bass)}", file=sys.stderr)
     report('TREBLE', treble, bar_ticks)
     report('BASS', bass, bar_ticks)

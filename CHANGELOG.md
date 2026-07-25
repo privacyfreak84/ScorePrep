@@ -3,6 +3,21 @@
 All notable changes to ScorePrep are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.3]
+
+### Changed
+
+- Reorganized the per-staff diagnostic report (`report()`) into clearly
+  labeled sections (`===== Staff Split =====`, `===== Notation (TREBLE/
+  BASS) =====`) with a tie-count breakdown (none / one tie / two+ ties)
+  instead of one dense summary line. Pure diagnostics -- `report()` only
+  reads already-finalized note data and prints, it doesn't mutate
+  anything, so this has no effect on the actual engraving decisions or
+  output MIDI (verified byte-identical before/after on a real test file).
+  Also fixed an off-by-one in the new tie-count buckets during
+  development: `true_tie_count` returns notehead count (minimum 1, even
+  for a plain untied note), not tie count -- actual ties = noteheads - 1.
+
 ## [1.2.2]
 
 ### Fixed
