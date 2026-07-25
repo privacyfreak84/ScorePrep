@@ -1018,7 +1018,8 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
         pedal_mode='ignore', min_note_ticks=None, playback_sustain=True, grid_mode='straight',
         track_selector=None, channel_override=None, duration_style='dotted',
         min_velocity=0, velocity_mode='passthrough', velocity_scale=1.0,
-        tie_weight=None, rest_weight=None, artic_weight=None):
+        tie_weight=None, rest_weight=None, artic_weight=None,
+        preserve_source_duration=True):
     """Runs the full cleanup pipeline. Shared by --interactive and normal
     CLI-argument mode. tempo, split_pitch, and time_sig may be None, in
     which case they're estimated from the source file."""
@@ -1202,12 +1203,18 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
     source_encoding_tempo, _ = detect_source_tempo(mid)
     source_encoding_tempo = source_encoding_tempo or 120.0
     if source_encoding_tempo != tempo:
-        print(f"Rescaling note timing from the source file's tick-encoding tempo "
-              f"({source_encoding_tempo} BPM -- the reference tempo used when the source's ticks "
-              f"were generated, not a musical judgement) to the notated output tempo ({tempo} BPM), "
-              f"so playback speed matches the original audio regardless of what tempo the score is "
-              f"labeled with.", file=sys.stderr)
-    rescale_notes_to_tempo(notes, source_encoding_tempo, tempo)
+        if preserve_source_duration:
+            print(f"Rescaling note timing from the source file's tick-encoding tempo "
+                  f"({source_encoding_tempo} BPM -- the reference tempo used when the source's ticks "
+                  f"were generated, not a musical judgement) to the notated output tempo ({tempo} BPM), "
+                  f"so playback speed matches the original audio regardless of what tempo the score is "
+                  f"labeled with.", file=sys.stderr)
+            rescale_notes_to_tempo(notes, source_encoding_tempo, tempo)
+        else:
+            print(f"tempo-rescale=change-speed -- leaving note ticks as-is and labeling the output "
+                  f"{tempo} BPM, so playback is genuinely {tempo / source_encoding_tempo:.2f}x the "
+                  f"source's speed (not rescaled to preserve the original real-world duration).",
+                  file=sys.stderr)
 
     resolve_note_durations(notes, temperature, bar_ticks)
 
@@ -1424,6 +1431,24 @@ def interactive_mode():
             tempo_default = 120.0
     tempo = _prompt("Tempo (BPM)", default=tempo_default, cast=float)
 
+    preserve_source_duration = True
+    if tempo != tempo_default:
+        print("You entered a tempo different from the detected/estimated one. This can mean two "
+              "different things:")
+        print("  preserve-duration: ticks get rescaled so the piece's real-world length still "
+              "matches the original audio -- use this if you're correcting a wrong/unreliable "
+              "tempo detection.")
+        print("  change-speed: ticks stay as-is, so this tempo genuinely changes playback speed -- "
+              "use this if you deliberately want the output to play faster or slower.")
+
+        def valid_rescale_mode(s):
+            if s.strip().lower() in ('preserve-duration', 'change-speed'):
+                return True, None
+            return False, "Must be 'preserve-duration' or 'change-speed'."
+        rescale_mode = _prompt("Tempo change intent (preserve-duration/change-speed)",
+                                default='preserve-duration', validate=valid_rescale_mode)
+        preserve_source_duration = (rescale_mode.strip().lower() == 'preserve-duration')
+
     def valid_time_sig(s):
         try:
             parse_time_sig(s)
@@ -1581,7 +1606,7 @@ def interactive_mode():
         pedal_mode, min_note_ticks, playback_sustain, grid_mode,
         ','.join(map(str, track_indices)), channel_override,
         duration_style, min_velocity, velocity_mode, velocity_scale,
-        tie_weight, rest_weight, artic_weight)
+        tie_weight, rest_weight, artic_weight, preserve_source_duration)
 
 
 def main():
@@ -1679,6 +1704,13 @@ def main():
                           'sustain invented beyond a note\'s real transcribed length (higher = '
                           'more faithful to real note-off timing and less willing to fabricate '
                           'legato to close a rest). Default: derived from --tie-temperature.')
+    ap.add_argument('--tempo-rescale', choices=['preserve-duration', 'change-speed'],
+                     default='preserve-duration',
+                     help='Only matters if --tempo differs from the source file\'s own detected '
+                          'tempo. "preserve-duration" (default): rescale note ticks so the '
+                          'piece\'s real-world length still matches the original audio -- use this '
+                          'if --tempo is correcting a wrong/unreliable detection. "change-speed": '
+                          'leave ticks as-is, so --tempo genuinely changes playback speed.')
     args = ap.parse_args()
 
     if args.interactive or args.input is None:
@@ -1703,7 +1735,8 @@ def main():
         args.pedal_mode, args.min_note_ticks, args.playback_sustain == 'on', args.grid,
         args.track, args.channel, args.clean_durations, args.min_velocity,
         args.velocity_mode, args.velocity_scale,
-        args.tie_weight, args.rest_weight, args.articulation_weight)
+        args.tie_weight, args.rest_weight, args.articulation_weight,
+        args.tempo_rescale == 'preserve-duration')
 
 
 if __name__ == '__main__':

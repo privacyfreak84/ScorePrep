@@ -3,6 +3,27 @@
 All notable changes to ScorePrep are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.2]
+
+### Fixed
+
+- **Changing `--tempo` away from the detected value silently had no
+  effect on real playback speed.** `rescale_notes_to_tempo` was built
+  for raw MT3-style transcriptions, where ticks are laid out against a
+  meaningless placeholder tempo and a user-supplied tempo is meant to
+  *correct* that -- so ticks get stretched to compensate, keeping
+  real-world duration locked to the original audio regardless of the
+  number typed. That's correct for genuine MT3 input, but wrong for
+  already-accurate sources, where a
+  different `--tempo` is a deliberate request to actually speed up or
+  slow down playback -- previously the stretch-and-relabel exactly
+  canceled out, so the result played at identical speed no matter what
+  tempo was entered. Added `--tempo-rescale {preserve-duration,
+  change-speed}` (also prompted interactively when the entered tempo
+  differs from the detected one). Default `preserve-duration` keeps the
+  old MT3-oriented behavior; `change-speed` leaves ticks untouched so
+  the tempo change is real.
+
 ## [1.2.1]
 
 ### Fixed

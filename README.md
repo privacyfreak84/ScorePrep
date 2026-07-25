@@ -272,6 +272,8 @@ Not promising a big list — just what's actively being considered next:
 - Same-pitch overlap priority (truncate earlier vs. delay later note)
 - Instrument/channel assignment on output (`program_change`)
 - Custom track naming
+- Voice-role-aware duration optimization (melody vs. accompaniment) — pending benchmark evidence, not yet justified
+- Exact repeat detection (post-quantization measure hashing, velocity excluded) + 1st/2nd-ending suggestion as a direct extension — optional, user-confirmed, not auto-applied; explicitly excludes fuzzy/ornamented/transposed repeat matching
 
 ## Changelog
 
