@@ -537,7 +537,7 @@ def resolve_note_durations(notes, temperature=0.0, bar_ticks=None):
         n['natural_end'] = max(n['f_end'], raw_end)
 
 
-def optimize_staff_durations(notes, temperature, bar_ticks, weights=None):
+def optimize_staff_durations(notes, temperature, bar_ticks, weights=None, stats=None):
     """The core engraving decision for one staff, run after
     resolve_note_durations has already established each note's hard
     ceiling (bar-span cap, tie-budget cap, 'nat_units' = real evidence).
@@ -642,6 +642,21 @@ def optimize_staff_durations(notes, temperature, bar_ticks, weights=None):
         new_end = onset + best_v * GRID
         for n in event:
             n['f_end'] = new_end
+
+        if stats is not None:
+            extended_ties = true_tie_count(onset, best_v, bar_ticks) - baseline_tc
+            rest_present_final = next_onset_units is not None and best_v < next_onset_units
+            for n in event:
+                member_fab = max(0, best_v - n['nat_units'])
+                if member_fab > 0:
+                    cat = 'invented_sustain'
+                elif extended_ties > 0:
+                    cat = 'extended_truthful'
+                elif rest_present_final:
+                    cat = 'rest_kept'
+                else:
+                    cat = 'exact_no_rest'
+                stats[cat] = stats.get(cat, 0) + 1
 
 
 def fix_same_pitch_overlaps(notes, tie_budget=1, bar_ticks=None):
@@ -993,7 +1008,7 @@ def estimate_split_pitch(notes, fallback=SPLIT_PITCH):
     return best_t
 
 
-def report(name, notes, bar_ticks):
+def report(name, notes, bar_ticks, opt_stats=None):
     """Pure diagnostic pass over already-finalized notes -- reads f_start/
     f_end/nat_units, mutates nothing, so restructuring this has zero effect
     on the actual engraving decisions made upstream."""
@@ -1030,6 +1045,20 @@ def report(name, notes, bar_ticks):
               file=sys.stderr)
     else:
         print(f"Invented sustain:     none needed at this tie-temperature", file=sys.stderr)
+
+    if opt_stats:
+        print(f"\n===== Optimizer Decisions ({name}) =====", file=sys.stderr)
+        print("(why each note's written length was chosen -- categories are mutually", file=sys.stderr)
+        print(" exclusive, checked in this order)", file=sys.stderr)
+        print(f"Exact, no rest:        {opt_stats.get('exact_no_rest', 0)}  "
+              f"(truthful baseline already reached the next note)", file=sys.stderr)
+        print(f"Rest kept:             {opt_stats.get('rest_kept', 0)}  "
+              f"(extending wasn't worth the cost, or there was no room to)", file=sys.stderr)
+        print(f"Extended, truthful:    {opt_stats.get('extended_truthful', 0)}  "
+              f"(used more ties than the bare minimum to close/shrink a rest, "
+              f"still within real evidence)", file=sys.stderr)
+        print(f"Invented sustain:      {opt_stats.get('invented_sustain', 0)}  "
+              f"(extended past real evidence to close/shrink a rest)", file=sys.stderr)
 
 
 def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
@@ -1250,16 +1279,17 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
     # close that gap. Since this second pass can only ever shorten notes
     # further (never lengthen), it can't reopen any overlap the previous
     # step just fixed, so one extra pass is sufficient.
-    optimize_staff_durations(treble, temperature, bar_ticks, weights)
-    optimize_staff_durations(bass, temperature, bar_ticks, weights)
+    treble_opt_stats, bass_opt_stats = {}, {}
+    optimize_staff_durations(treble, temperature, bar_ticks, weights, treble_opt_stats)
+    optimize_staff_durations(bass, temperature, bar_ticks, weights, bass_opt_stats)
 
     print(f"tie-temperature={temperature:.2f}  (max_bars={1 + round(temperature * 7)}, "
           f"tie_budget={tie_budget}, weights: tie={weights[0]:.2f} rest={weights[1]:.2f} "
           f"articulation={weights[2]:.2f})", file=sys.stderr)
     print(f"\n===== Staff Split =====", file=sys.stderr)
     print(f"Processed {len(notes)} notes -> treble {len(treble)}, bass {len(bass)}", file=sys.stderr)
-    report('TREBLE', treble, bar_ticks)
-    report('BASS', bass, bar_ticks)
+    report('TREBLE', treble, bar_ticks, treble_opt_stats)
+    report('BASS', bass, bar_ticks, bass_opt_stats)
 
     treble_track = build_track(treble, 'Treble')
     bass_track = build_track(bass, 'Bass')

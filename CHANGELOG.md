@@ -3,6 +3,28 @@
 All notable changes to ScorePrep are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.4]
+
+### Added
+
+- `report()` now prints an `===== Optimizer Decisions =====` section per
+  staff: why each note's written length was chosen, as 4 mutually
+  exclusive categories (exact/no rest, rest kept, extended-but-truthful,
+  invented sustain). Required actually instrumenting
+  `optimize_staff_durations`'s decision loop (not just reformatting an
+  existing report) -- added an optional `stats` dict parameter, populated
+  additively from values the loop already computes; the note-selection
+  logic itself is completely unchanged. Verified byte-identical output
+  MIDI before/after on a real test file. Only collected on each staff's
+  final optimization pass (after the same-pitch-overlap re-harmonize),
+  so the counts reflect the actual final decision, not an intermediate
+  one. Caught and fixed a real bug: fabrication is
+  computed as a sum across an entire chord, but crediting a whole
+  chord's worth of notes as "invented sustain" whenever that sum was
+  nonzero over-counted -- a 2-note chord where only one note actually
+  needed invented sustain was crediting both. Now categorized per
+  individual note within the event.
+
 ## [1.2.3]
 
 ### Changed
