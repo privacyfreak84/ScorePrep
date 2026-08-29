@@ -73,6 +73,30 @@ from collections import defaultdict
 import mido
 from mido import MidiFile, MidiTrack, Message, MetaMessage
 
+# Engraving profiles: bundle the flags that matter most for the readability/
+# fidelity tradeoff into one choice. TT values reflect the benchmark suite's
+# findings (see benchmarks/ -- TT~0.10 often too choppy, ~0.15-0.20 is a
+# quality plateau, diminishing returns pushing further past that). Any flag
+# also given explicitly on the command line still wins over the profile.
+PROFILES = {
+    'readable': dict(tie_temperature=0.0, pedal_mode='ignore',
+                      grid='straight', clean_durations='dotted'),
+    'balanced': dict(tie_temperature=0.15, pedal_mode='ignore',
+                      grid='straight', clean_durations='dotted'),
+    'faithful': dict(tie_temperature=1.0, pedal_mode='reflect',
+                      grid='straight', clean_durations='dotted'),
+}
+
+# Melody preservation: biases the duration optimizer's per-event weights
+# using classify_voice_roles()'s output, rather than adding a second
+# decision algorithm. A melody event gets ties made cheaper and rests
+# made costlier (protect its continuity/truthfulness); an accompaniment
+# event gets the opposite (decluttering is fine to buy with more rests
+# and fewer ties). Independent of --tie-temperature -- these multiply
+# whatever weights the temperature already picked.
+MELODY_TIE_MULT, MELODY_REST_MULT = 0.5, 1.5
+ACCOMP_TIE_MULT, ACCOMP_REST_MULT = 1.4, 0.7
+
 
 def _config_path():
     base = os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config')
@@ -537,7 +561,79 @@ def resolve_note_durations(notes, temperature=0.0, bar_ticks=None):
         n['natural_end'] = max(n['f_end'], raw_end)
 
 
-def optimize_staff_durations(notes, temperature, bar_ticks, weights=None, stats=None):
+def classify_voice_roles(notes):
+    """Heuristic per-note classification into 'melody' vs 'accompaniment'.
+
+    This is foundational infrastructure, not a shipped feature: it only
+    *annotates* each note dict with 'voice_role' and 'voice_confidence'
+    (0.0-1.0). Nothing downstream -- the optimizer, the treble/bass split,
+    engraving output -- reads these fields yet. The point is to have a
+    real, inspectable signal to validate against actual pieces before any
+    future feature (melody preservation, intelligent hand assignment,
+    voice-aware quantization, confidence warnings) is allowed to change
+    engraving behavior based on it.
+
+    Approach: classic "skyline" (the highest simultaneous pitch at a given
+    onset is usually the melody) as the base signal, smoothed by
+    penalizing an isolated skyline note that jumps far from its
+    neighbors -- a common false positive where a dense accompaniment
+    chord's top note briefly pokes above the real tune. Chord density,
+    note duration, and relative velocity contribute secondary evidence:
+    melody in piano transcriptions tends to be sparser (single notes more
+    than chords), longer, and often (not always) the loudest note in its
+    onset. Must run on the full, unsplit note list -- accompaniment
+    figuration can sit in the treble register (e.g. Alberti bass), so
+    this can't be inferred from split_pitch alone.
+
+    Expects 'f_start', 'nat_units', 'pitch', 'velocity' already set
+    (i.e. call after resolve_note_durations). Mutates notes in place.
+    """
+    if not notes:
+        return
+
+    by_onset = defaultdict(list)
+    for n in notes:
+        by_onset[n['f_start']].append(n)
+    onsets = sorted(by_onset)
+
+    durations = sorted(n['nat_units'] for n in notes if n.get('nat_units', 0) > 0)
+    median_dur = durations[len(durations) // 2] if durations else 1
+
+    for onset in onsets:
+        chord = by_onset[onset]
+        top = max(chord, key=lambda n: n['pitch'])
+        avg_vel = sum(n['vel'] for n in chord) / len(chord)
+        for n in chord:
+            score = 0.45 if n is top else 0.0
+            score += 0.15 if len(chord) == 1 else -0.05 * min(len(chord) - 1, 3)
+            score += 0.20 * min(1.0, n.get('nat_units', 0) / median_dur) if median_dur else 0.0
+            score += 0.15 if n['vel'] >= avg_vel else 0.0
+            n['_voice_score'] = max(0.0, min(1.0, score))
+
+    # Smoothing pass: an isolated skyline spike far from the established
+    # line is usually a chord's top note poking up, not a real melodic
+    # leap -- demote it in favor of whichever chord member actually
+    # continues the line, if one exists within a semitone-jump threshold.
+    JUMP_SEMITONES = 12
+    prev_pitch = None
+    for onset in onsets:
+        chord = by_onset[onset]
+        top = max(chord, key=lambda n: n['pitch'])
+        if prev_pitch is not None and abs(top['pitch'] - prev_pitch) > JUMP_SEMITONES and len(chord) > 1:
+            closer = min(chord, key=lambda n: abs(n['pitch'] - prev_pitch))
+            if closer is not top and abs(closer['pitch'] - prev_pitch) <= JUMP_SEMITONES:
+                top['_voice_score'] *= 0.5
+                closer['_voice_score'] = min(1.0, closer['_voice_score'] + 0.25)
+        prev_pitch = max(chord, key=lambda n: n['_voice_score'])['pitch']
+
+    for n in notes:
+        score = n.pop('_voice_score')
+        n['voice_role'] = 'melody' if score >= 0.5 else 'accompaniment'
+        n['voice_confidence'] = round(abs(score - 0.5) * 2, 2)
+
+
+def optimize_staff_durations(notes, temperature, bar_ticks, weights=None, stats=None,
+                              melody_preservation=False):
     """The core engraving decision for one staff, run after
     resolve_note_durations has already established each note's hard
     ceiling (bar-span cap, tie-budget cap, 'nat_units' = real evidence).
@@ -576,6 +672,13 @@ def optimize_staff_durations(notes, temperature, bar_ticks, weights=None, stats=
     constraint). Mutates 'f_end' in place; leaves 'nat_units'/
     'natural_end' untouched so later passes (and playback-sustain)
     still see the true evidence.
+
+    melody_preservation: if True and notes carry 'voice_role' (i.e.
+    classify_voice_roles has run), each event's tie/rest weights are
+    biased by its dominant voice role before the cost search --
+    MELODY_TIE_MULT/MELODY_REST_MULT for a melody event, ACCOMP_TIE_MULT/
+    ACCOMP_REST_MULT otherwise. Purely a weight bias on the existing cost
+    search, not a separate algorithm.
     """
     if not notes:
         return
@@ -627,14 +730,23 @@ def optimize_staff_durations(notes, temperature, bar_ticks, weights=None, stats=
         baseline_tc = true_tie_count(onset, baseline, bar_ticks)
 
         best_v, best_cost, best_fab = baseline, None, None
+        if melody_preservation and any('voice_role' in n for n in event):
+            is_melody = any(n.get('voice_role') == 'melody' for n in event)
+            eff_tie_w = tie_w * (MELODY_TIE_MULT if is_melody else ACCOMP_TIE_MULT)
+            eff_rest_w = rest_w * (MELODY_REST_MULT if is_melody else ACCOMP_REST_MULT)
+            if stats is not None:
+                key = 'melody_biased' if is_melody else 'accompaniment_biased'
+                stats[key] = stats.get(key, 0) + 1
+        else:
+            eff_tie_w, eff_rest_w = tie_w, rest_w
         for v in range(baseline, ceiling + 1):
             tc = true_tie_count(onset, v, bar_ticks)
             if tc > tie_budget:
                 continue
             rest_present = next_onset_units is not None and v < next_onset_units
             fabrication = sum(max(0, v - nat) for nat in member_nat_units)
-            cost = (tie_w * max(0, tc - baseline_tc)
-                    + rest_w * (len(event) if rest_present else 0)
+            cost = (eff_tie_w * max(0, tc - baseline_tc)
+                    + eff_rest_w * (len(event) if rest_present else 0)
                     + artic_w * fabrication)
             if best_cost is None or cost < best_cost or (cost == best_cost and fabrication < best_fab):
                 best_v, best_cost, best_fab = v, cost, fabrication
@@ -1008,6 +1120,45 @@ def estimate_split_pitch(notes, fallback=SPLIT_PITCH):
     return best_t
 
 
+def bar_diagnostics(notes, bar_ticks, top_n=10):
+    """Per-bar rollup of the same signals report() already computes (chord
+    conflicts, rests, heavy tie chains, cross-bar ties, invented sustain),
+    so a reader can jump straight to the handful of measures actually worth
+    a manual look instead of scanning the whole score. Pure read-over of
+    already-finalized notes, same as report(); doesn't affect engraving."""
+    bars = defaultdict(lambda: {'conflict': 0, 'rest': 0, 'heavy_tie': 0,
+                                 'cross_bar_tie': 0, 'invented': 0})
+
+    onsets = sorted(set(n['f_start'] for n in notes))
+    next_onset_after = {a: b for a, b in zip(onsets, onsets[1:])}
+
+    by_onset = defaultdict(set)
+    for n in notes:
+        by_onset[n['f_start']].add(n['f_end'] - n['f_start'])
+    for onset, durs in by_onset.items():
+        if len(durs) > 1:
+            bars[onset // bar_ticks]['conflict'] += 1
+
+    for n in notes:
+        bar = n['f_start'] // bar_ticks
+        units = (n['f_end'] - n['f_start']) // GRID
+        ties = true_tie_count(n['f_start'], units, bar_ticks) - 1
+        if ties >= 2:
+            bars[bar]['heavy_tie'] += 1
+        if bar != (n['f_end'] - 1) // bar_ticks:
+            bars[bar]['cross_bar_tie'] += 1
+        nxt = next_onset_after.get(n['f_start'])
+        if nxt is not None and nxt - n['f_end'] > 0:
+            bars[bar]['rest'] += 1
+        if units - n.get('nat_units', 0) > 0:
+            bars[bar]['invented'] += 1
+
+    scored = [(bar, sum(c.values()), c) for bar, c in bars.items()]
+    scored = [x for x in scored if x[1] > 0]
+    scored.sort(key=lambda x: (-x[1], x[0]))
+    return scored[:top_n]
+
+
 def report(name, notes, bar_ticks, opt_stats=None):
     """Pure diagnostic pass over already-finalized notes -- reads f_start/
     f_end/nat_units, mutates nothing, so restructuring this has zero effect
@@ -1060,13 +1211,49 @@ def report(name, notes, bar_ticks, opt_stats=None):
         print(f"Invented sustain:      {opt_stats.get('invented_sustain', 0)}  "
               f"(extended past real evidence to close/shrink a rest)", file=sys.stderr)
 
+    top_bars = bar_diagnostics(notes, bar_ticks)
+    if top_bars:
+        print(f"\n===== Measures Needing Attention ({name}) =====", file=sys.stderr)
+        print("(top measures by combined issue count, 1-indexed -- worth a manual look)",
+              file=sys.stderr)
+        for bar, total, c in top_bars:
+            parts = []
+            if c['conflict']:
+                parts.append(f"{c['conflict']} chord conflict(s)")
+            if c['rest']:
+                parts.append(f"{c['rest']} rest(s)")
+            if c['heavy_tie']:
+                parts.append(f"{c['heavy_tie']} heavy tie chain(s)")
+            if c['cross_bar_tie']:
+                parts.append(f"{c['cross_bar_tie']} cross-bar tie(s)")
+            if c['invented']:
+                parts.append(f"{c['invented']} invented sustain")
+            print(f"  Measure {bar + 1}: {', '.join(parts)}", file=sys.stderr)
+
+    if notes and 'voice_role' in notes[0]:
+        n_melody = sum(1 for n in notes if n['voice_role'] == 'melody')
+        n_accomp = len(notes) - n_melody
+        avg_conf = sum(n['voice_confidence'] for n in notes) / len(notes)
+        low_conf = sum(1 for n in notes if n['voice_confidence'] < 0.3)
+        used = opt_stats is not None and ('melody_biased' in opt_stats or 'accompaniment_biased' in opt_stats)
+        print(f"\n===== Voice Roles ({name}{'' if used else ', experimental'}) =====", file=sys.stderr)
+        if used:
+            print("(used this run to bias the duration optimizer's weights -- see "
+                  "melody-preservation above)", file=sys.stderr)
+        else:
+            print("(heuristic melody/accompaniment classification -- not used by any "
+                  "engraving decision yet; shown for validation only)", file=sys.stderr)
+        print(f"Melody: {n_melody}  Accompaniment: {n_accomp}  "
+              f"Avg confidence: {avg_conf:.2f}  Low-confidence (<0.3): {low_conf}",
+              file=sys.stderr)
+
 
 def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
         pedal_mode='ignore', min_note_ticks=None, playback_sustain=True, grid_mode='straight',
         track_selector=None, channel_override=None, duration_style='dotted',
         min_velocity=0, velocity_mode='passthrough', velocity_scale=1.0,
         tie_weight=None, rest_weight=None, artic_weight=None,
-        preserve_source_duration=True):
+        preserve_source_duration=True, melody_preservation=False):
     """Runs the full cleanup pipeline. Shared by --interactive and normal
     CLI-argument mode. tempo, split_pitch, and time_sig may be None, in
     which case they're estimated from the source file."""
@@ -1264,14 +1451,17 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
                   file=sys.stderr)
 
     resolve_note_durations(notes, temperature, bar_ticks)
+    classify_voice_roles(notes)
 
     treble = [n for n in notes if n['pitch'] >= split_pitch]
     bass = [n for n in notes if n['pitch'] < split_pitch]
 
     tie_budget = tie_budget_for(temperature)
     weights = optimizer_weights(temperature, tie_weight, rest_weight, artic_weight)
-    optimize_staff_durations(treble, temperature, bar_ticks, weights)
-    optimize_staff_durations(bass, temperature, bar_ticks, weights)
+    optimize_staff_durations(treble, temperature, bar_ticks, weights,
+                              melody_preservation=melody_preservation)
+    optimize_staff_durations(bass, temperature, bar_ticks, weights,
+                              melody_preservation=melody_preservation)
     fix_same_pitch_overlaps(treble, tie_budget, bar_ticks)
     fix_same_pitch_overlaps(bass, tie_budget, bar_ticks)
     # fixing a same-pitch overlap can shorten just one member of a chord
@@ -1280,8 +1470,15 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
     # further (never lengthen), it can't reopen any overlap the previous
     # step just fixed, so one extra pass is sufficient.
     treble_opt_stats, bass_opt_stats = {}, {}
-    optimize_staff_durations(treble, temperature, bar_ticks, weights, treble_opt_stats)
-    optimize_staff_durations(bass, temperature, bar_ticks, weights, bass_opt_stats)
+    optimize_staff_durations(treble, temperature, bar_ticks, weights, treble_opt_stats,
+                              melody_preservation=melody_preservation)
+    optimize_staff_durations(bass, temperature, bar_ticks, weights, bass_opt_stats,
+                              melody_preservation=melody_preservation)
+    if melody_preservation:
+        print(f"melody-preservation=on -- duration optimizer weights biased per event "
+              f"by voice role (melody: tie x{MELODY_TIE_MULT} rest x{MELODY_REST_MULT}, "
+              f"accompaniment: tie x{ACCOMP_TIE_MULT} rest x{ACCOMP_REST_MULT})",
+              file=sys.stderr)
 
     print(f"tie-temperature={temperature:.2f}  (max_bars={1 + round(temperature * 7)}, "
           f"tie_budget={tie_budget}, weights: tie={weights[0]:.2f} rest={weights[1]:.2f} "
@@ -1530,13 +1727,29 @@ def interactive_mode():
     split_pitch = _prompt("Staff split pitch (MIDI note number, 60 = middle C)",
                            default=estimated_split, cast=int, validate=valid_pitch)
 
-    def valid_temp(t):
-        if 0.0 <= t <= 1.0:
+    def valid_profile(p):
+        if p in ('readable', 'balanced', 'faithful', 'custom'):
             return True, None
-        return False, "Must be between 0.0 and 1.0."
-    print("\nTie temperature: 0.0 = fewest ties, most rests (readable, less exact).")
-    print("                  1.0 = closest fidelity to original timing, more ties.")
-    temperature = _prompt("Tie temperature (0.0-1.0)", default=0.0, cast=float, validate=valid_temp)
+        return False, "Must be 'readable', 'balanced', 'faithful', or 'custom'."
+    print("\nEngraving profile: 'readable' favors fewest ties/simplest rhythms (best")
+    print("for sight-reading or practice). 'balanced' is the benchmark-tested sweet")
+    print("spot between readability and fidelity. 'faithful' sticks closest to the")
+    print("original performed timing. 'custom' sets tie-temperature and the")
+    print("pedal/grid/duration flags below individually.")
+    profile = _prompt("Engraving profile (readable/balanced/faithful/custom)",
+                       default='balanced', validate=valid_profile)
+
+    if profile != 'custom':
+        temperature = PROFILES[profile]['tie_temperature']
+        print(f"  -> tie-temperature={temperature}")
+    else:
+        def valid_temp(t):
+            if 0.0 <= t <= 1.0:
+                return True, None
+            return False, "Must be between 0.0 and 1.0."
+        print("\nTie temperature: 0.0 = fewest ties, most rests (readable, less exact).")
+        print("                  1.0 = closest fidelity to original timing, more ties.")
+        temperature = _prompt("Tie temperature (0.0-1.0)", default=0.0, cast=float, validate=valid_temp)
 
     print("\nPlayback sustain: keeps the written notation exactly as clean as the tie")
     print("temperature above produces, but adds sustain-pedal automation so MIDI")
@@ -1544,52 +1757,54 @@ def interactive_mode():
     print("choppy. Doesn't affect what MuseScore displays -- only how it sounds.")
     playback_sustain = _prompt_bool("Add playback sustain pedal automation?", default=True)
 
-    pedal_mode = 'ignore'
+    pedal_mode = PROFILES[profile]['pedal_mode'] if profile != 'custom' else 'ignore'
     min_note_ticks = None
-    grid_mode = 'straight'
-    duration_style = 'dotted'
+    grid_mode = PROFILES[profile]['grid'] if profile != 'custom' else 'straight'
+    duration_style = PROFILES[profile]['clean_durations'] if profile != 'custom' else 'dotted'
     min_velocity = 0
     velocity_mode = 'passthrough'
     velocity_scale = 1.0
     tie_weight = rest_weight = artic_weight = None
     print()
-    if _prompt_bool("Show advanced options? (sustain pedal handling, noise filtering, "
-                     "triplet/swing grid, duration style, velocity)", default=False):
-        print("\nSustain pedal: 'ignore' drops pedal data entirely (default).")
-        print("               'reflect' extends a note's length to the pedal-up point")
-        print("               if its release happens while the pedal is still held --")
-        print("               a more musically honest sustain length.")
+    adv_prompt = "Show advanced options? (noise filtering, velocity"
+    adv_prompt += ")" if profile != 'custom' else ", sustain pedal handling, triplet/swing grid, duration style)"
+    if _prompt_bool(adv_prompt, default=False):
+        if profile == 'custom':
+            print("\nSustain pedal: 'ignore' drops pedal data entirely (default).")
+            print("               'reflect' extends a note's length to the pedal-up point")
+            print("               if its release happens while the pedal is still held --")
+            print("               a more musically honest sustain length.")
 
-        def valid_pedal(p):
-            if p in ('ignore', 'reflect'):
-                return True, None
-            return False, "Must be 'ignore' or 'reflect'."
-        pedal_mode = _prompt("Pedal mode (ignore/reflect)", default='ignore', validate=valid_pedal)
+            def valid_pedal(p):
+                if p in ('ignore', 'reflect'):
+                    return True, None
+                return False, "Must be 'ignore' or 'reflect'."
+            pedal_mode = _prompt("Pedal mode (ignore/reflect)", default='ignore', validate=valid_pedal)
 
-        print("\nQuantization grid: 'straight' (default) only hits straight 16th-note")
-        print("                    subdivisions -- a genuinely triplet/swung passage gets")
-        print("                    forced onto the nearest straight 16th, distorting it.")
-        print("                    'triplet' uses a finer grid that natively fits both")
-        print("                    straight and triplet-eighth subdivisions.")
+            print("\nQuantization grid: 'straight' (default) only hits straight 16th-note")
+            print("                    subdivisions -- a genuinely triplet/swung passage gets")
+            print("                    forced onto the nearest straight 16th, distorting it.")
+            print("                    'triplet' uses a finer grid that natively fits both")
+            print("                    straight and triplet-eighth subdivisions.")
 
-        def valid_grid(g):
-            if g in ('straight', 'triplet'):
-                return True, None
-            return False, "Must be 'straight' or 'triplet'."
-        grid_mode = _prompt("Quantization grid (straight/triplet)", default='straight',
-                             validate=valid_grid)
+            def valid_grid(g):
+                if g in ('straight', 'triplet'):
+                    return True, None
+                return False, "Must be 'straight' or 'triplet'."
+            grid_mode = _prompt("Quantization grid (straight/triplet)", default='straight',
+                                 validate=valid_grid)
 
-        print("\nDuration style: 'dotted' (default) allows single noteheads with dots")
-        print("                 (dotted-quarter, etc). 'powers2' restricts to plain")
-        print("                 power-of-two values only -- a plainer look, at the cost")
-        print("                 of needing a tie wherever a dot would've done the job.")
+            print("\nDuration style: 'dotted' (default) allows single noteheads with dots")
+            print("                 (dotted-quarter, etc). 'powers2' restricts to plain")
+            print("                 power-of-two values only -- a plainer look, at the cost")
+            print("                 of needing a tie wherever a dot would've done the job.")
 
-        def valid_duration_style(d):
-            if d in ('dotted', 'powers2'):
-                return True, None
-            return False, "Must be 'dotted' or 'powers2'."
-        duration_style = _prompt("Duration style (dotted/powers2)", default='dotted',
-                                  validate=valid_duration_style)
+            def valid_duration_style(d):
+                if d in ('dotted', 'powers2'):
+                    return True, None
+                return False, "Must be 'dotted' or 'powers2'."
+            duration_style = _prompt("Duration style (dotted/powers2)", default='dotted',
+                                      validate=valid_duration_style)
         configure_grid(grid_mode, duration_style)
 
         auto_min = max(1, GRID // 4)
@@ -1650,17 +1865,38 @@ def interactive_mode():
         else:
             tie_weight = rest_weight = artic_weight = None
 
+        print("\nMelody preservation [experimental]: biases the duration optimizer's")
+        print("weights per note using a heuristic melody/accompaniment classifier --")
+        print("melody gets cheaper ties and costlier rests (protect its continuity),")
+        print("accompaniment gets the opposite (declutter more freely). Check the")
+        print("report's Voice Roles section before trusting this on a given piece.")
+        melody_preservation = _prompt_bool("Enable melody preservation?", default=False)
+    else:
+        melody_preservation = False
+
     print()
     run(input_path, output_path, tempo, split_pitch, temperature, time_sig,
         pedal_mode, min_note_ticks, playback_sustain, grid_mode,
         ','.join(map(str, track_indices)), channel_override,
         duration_style, min_velocity, velocity_mode, velocity_scale,
-        tie_weight, rest_weight, artic_weight, preserve_source_duration)
+        tie_weight, rest_weight, artic_weight, preserve_source_duration,
+        melody_preservation)
 
 
 def main():
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument('--profile', choices=list(PROFILES), default=None)
+    pre_args, _ = pre.parse_known_args()
+
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--profile', choices=list(PROFILES), default=None,
+                     help='Set --tie-temperature, --pedal-mode, --grid, and --clean-durations '
+                          'all at once. "readable": fewest ties, simplest rhythms -- best for '
+                          'sight-reading/practice. "balanced": the benchmark-tested sweet spot '
+                          'between readability and fidelity. "faithful": closest to the original '
+                          'performed timing, pedal reflected. Any of the four flags also given '
+                          'explicitly still overrides the profile\'s value for that flag.')
     ap.add_argument('input', nargs='?', default=None,
                      help='source MIDI file (raw transcription). Omit both input and '
                           'output, or pass --interactive, to be prompted step by step instead.')
@@ -1760,6 +1996,16 @@ def main():
                           'piece\'s real-world length still matches the original audio -- use this '
                           'if --tempo is correcting a wrong/unreliable detection. "change-speed": '
                           'leave ticks as-is, so --tempo genuinely changes playback speed.')
+    ap.add_argument('--melody-preservation', choices=['on', 'off'], default='off',
+                     help='[experimental] "off" (default): duration optimizer weights are the '
+                          'same for every note. "on": bias weights per note using the heuristic '
+                          'melody/accompaniment classifier -- melody gets cheaper ties and '
+                          'costlier rests (protect its continuity), accompaniment gets the '
+                          'opposite (declutter more freely). Built on a still-experimental '
+                          'classifier; check the Voice Roles section of the report before '
+                          'trusting this on a given piece.')
+    if pre_args.profile:
+        ap.set_defaults(**PROFILES[pre_args.profile])
     args = ap.parse_args()
 
     if args.interactive or args.input is None:
@@ -1785,7 +2031,7 @@ def main():
         args.track, args.channel, args.clean_durations, args.min_velocity,
         args.velocity_mode, args.velocity_scale,
         args.tie_weight, args.rest_weight, args.articulation_weight,
-        args.tempo_rescale == 'preserve-duration')
+        args.tempo_rescale == 'preserve-duration', args.melody_preservation == 'on')
 
 
 if __name__ == '__main__':

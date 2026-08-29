@@ -37,3 +37,7 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+builds/
+Containment-reducetest/
+ScorePrep-Test/
+Test-Songs/

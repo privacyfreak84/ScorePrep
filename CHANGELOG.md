@@ -3,6 +3,54 @@
 All notable changes to ScorePrep are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.5]
+
+### Added
+
+- `--melody-preservation on` [experimental] biases the duration
+  optimizer's weights per note using the voice-role classifier below:
+  melody gets cheaper ties and costlier rests (protect its continuity),
+  accompaniment gets the opposite (declutter more freely). Off by
+  default -- reuses the existing cost-minimizing optimizer rather than
+  adding a second decision path, so it's purely a weight bias, not a new
+  algorithm. Available in interactive mode's advanced options too. The
+  report's "Voice Roles" section says outright whether it actually
+  influenced a given run.
+- New internal `classify_voice_roles()` pass tags every note as likely
+  "melody" or "accompaniment" with a confidence score, using a
+  skyline-plus-smoothing heuristic (highest simultaneous pitch, chord
+  density, note length, and relative velocity). This is groundwork for
+  future features (melody preservation, smarter hand assignment,
+  voice-aware quantization, confidence warnings), not a feature by
+  itself yet -- nothing about the actual engraving output changes.
+  Verified byte-identical output before/after on a real test file. A new
+  experimental "Voice Roles" section in the diagnostic report shows the
+  melody/accompaniment split and average confidence per staff, so the
+  heuristic can be checked against real pieces before anything is built
+  on top of it.
+- `--profile {readable,balanced,faithful}` sets tie-temperature, pedal
+  mode, grid, and duration style all at once instead of tuning them
+  individually. "readable" favors fewest ties for sight-reading/practice,
+  "balanced" is the benchmark-tested sweet spot, "faithful" sticks
+  closest to the original performance. Available in interactive mode too.
+  Any of the four flags given explicitly still overrides the profile's
+  value for that flag.
+- `report()` now ends with a "Measures Needing Attention" section listing
+  the measures with the most combined issues (chord conflicts, rests,
+  heavy tie chains, cross-bar ties, invented sustain), so you can jump
+  straight to the spots actually worth a manual look instead of scanning
+  the whole score. Diagnostics only -- doesn't change engraving output.
+
+### Decided
+
+- Closed out the question of whether the duration optimizer needs a
+  voice-role-aware redesign (treating melody and accompaniment
+  differently) for a future v1.3. A benchmark suite spanning 10 pieces
+  across genres -- Bollywood, classical, jazz, film/anime, ambient --
+  found no case where melody read well but accompaniment stayed
+  cluttered in a way a global tie-temperature couldn't fix. The current
+  global-tie-temperature optimizer stays as-is; no code changes.
+
 ## [1.2.4]
 
 ### Added
