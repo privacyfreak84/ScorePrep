@@ -304,6 +304,35 @@ the true ring-out length for playback — so the score reads well and
 still sounds like the performance.
 </details>
 
+## Companion tool: reduce_test.py
+
+A separate, standalone script — not part of ScorePrep.py, not a
+ScorePrep feature, no shared code between them. **Prototype, not yet
+benchmarked against real pieces.**
+
+ScorePrep expects single-instrument piano MIDI as input. If what you
+actually have is a multi-track band/ensemble file (vocals, guitars,
+bass, drums, ...) and you want a piano-reduction arrangement first,
+`reduce_test.py` handles that separate problem: it merges the pitched
+tracks (drums excluded), thins dense chords down to a playable size,
+collapses repeated-attack/glide artifacts, and writes out a single-track
+MIDI at ScorePrep's expected 384 ticks-per-beat — meant to be fed into
+`ScorePrep.py` next, not a replacement for it.
+
+This is a deliberate scope boundary, not an oversight: deciding *which
+notes survive* a reduction is an arrangement decision, while ScorePrep
+only ever decides *how to notate* content that's already settled. Kept
+as a separate tool so that boundary stays clear.
+
+```bash
+python3 reduce_test.py band_multitrack.mid --list-tracks   # inspect tracks first
+python3 reduce_test.py band_multitrack.mid reduced.mid --melody-track "Lead Vocal" --bass-track "Bass"
+python3 ScorePrep.py reduced.mid clean.mid --tie-temperature 0.15   # then the usual pipeline
+```
+
+Or run it with no arguments for the same step-by-step interactive mode
+ScorePrep.py offers. Run `reduce_test.py --help` for the full flag list.
+
 ## Roadmap
 
 Not promising a big list — just what's actively being considered next:

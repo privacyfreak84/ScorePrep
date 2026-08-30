@@ -3,6 +3,43 @@
 All notable changes to ScorePrep are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.6.n]
+
+### Added
+
+- `reduce_test.py`, a standalone companion script (not part of
+  ScorePrep.py, no shared code) for a separate problem: reducing a
+  multi-track band/ensemble MIDI down to a single playable piano part,
+  meant to feed into ScorePrep.py next when your source isn't already
+  piano MIDI. See the README's "Companion tool" section. Explicitly a
+  prototype, not yet benchmarked against real pieces.
+
+### Fixed
+
+Found while hardening `reduce_test.py` for repo inclusion:
+
+- Missing/unreadable input file, malformed `--importance-weights`
+  (wrong count, non-numeric, or negative), a non-positive
+  `--max-chord-size`, and Ctrl+C/EOF during interactive mode all used to
+  crash with a raw traceback (or, for `--max-chord-size`, silently
+  produce confusing output instead of erroring). All now fail with a
+  clear message instead.
+- Selecting an unnamed track by number in interactive mode matched it
+  by its index as a plain substring (e.g. "1"), which could
+  accidentally match an unrelated track whose name happened to contain
+  that digit (e.g. "Guitar 1"). Now matched by exact index instead.
+- Every numeric CLI flag and interactive prompt now rejects
+  out-of-range values (negative fractions/tick counts) up front rather
+  than accepting them silently.
+- The output directory is now created automatically if it doesn't
+  exist, and a write failure is reported cleanly instead of crashing.
+  A run with no notes found now prints a warning instead of silently
+  writing an empty file with no explanation. A final "Saved <path>"
+  line now confirms success, matching ScorePrep.py's own convention.
+- Added `--list-tracks`, a dry-run flag that prints the track listing
+  and exits without running the reduction, for checking track numbers
+  before committing to melody/bass/priority choices.
+
 ## [1.2.6]
 
 ### Added
