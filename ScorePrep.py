@@ -453,14 +453,32 @@ def minimal_tie_count(units):
 
 def true_tie_count(onset, units, bar_ticks):
     """Real number of tied noteheads MuseScore needs to render a note of
-    `units` grid-units starting at `onset`: minimal_tie_count's
-    duration-value decomposition, PLUS one extra split for every barline
-    the span crosses -- a single notehead can never be drawn straddling a
-    barline no matter how "clean" its duration value is, and
-    minimal_tie_count alone doesn't know where the barlines are."""
+    `units` grid-units starting at `onset`. Splits the span at every
+    barline it crosses, then decomposes each resulting sub-segment
+    independently via minimal_tie_count and sums them.
+
+    This can't be approximated as minimal_tie_count(units) + bar_crossings
+    (an earlier version did exactly that): a barline split forces the
+    pre-barline segment to be whatever's left until the barline, which
+    often isn't a clean value on its own even when the note's total
+    duration would have decomposed cleanly -- e.g. 16 units starting 1
+    unit before a barline splits into a 1-unit segment (clean, 1
+    notehead) and a 15-unit remainder, which itself needs 2 noteheads
+    (12+3), for 3 total -- not the 2 that "+1 per crossing" would predict.
+    """
     end = onset + units * GRID
-    bar_crossings = max(0, (end - 1) // bar_ticks - onset // bar_ticks)
-    return minimal_tie_count(units) + bar_crossings
+    bounds = [onset]
+    b = (onset // bar_ticks + 1) * bar_ticks
+    while b < end:
+        bounds.append(b)
+        b += bar_ticks
+    bounds.append(end)
+    total = 0
+    for a, z in zip(bounds, bounds[1:]):
+        seg_units = (z - a) // GRID
+        if seg_units > 0:
+            total += minimal_tie_count(seg_units)
+    return total
 
 
 def best_units_within_budget(raw_units, tie_budget, onset=None, bar_ticks=None):
@@ -1120,6 +1138,131 @@ def estimate_split_pitch(notes, fallback=SPLIT_PITCH):
     return best_t
 
 
+def compute_dynamic_split_points(notes, bar_ticks, window_bars=8, fallback=SPLIT_PITCH, max_step=4):
+    """Per-window treble/bass split, instead of one fixed value for the
+    whole piece. Reuses estimate_split_pitch's Otsu-style estimate, just
+    run separately on each window_bars-bar window of notes so the split
+    can follow the music's register drifting over time (e.g. a verse
+    sitting lower than a chorus), rather than forcing one hand-position
+    compromise across the entire piece.
+
+    Two things keep this from being noisy or jumpy in practice:
+    - a sparse window (too few notes, or too little pitch spread, for
+      estimate_split_pitch to make a confident call) falls back to the
+      PREVIOUS window's chosen split rather than snapping back to the
+      global fallback, so a quiet passage doesn't cause a spurious jump;
+    - the per-window step is hard-capped at max_step semitones, since a
+      hand can't instantly relocate and an abrupt split-point jump would
+      look like a notation error, not a musical one.
+
+    Returns (window_ticks, {window_index: split_pitch}); window_index for
+    a note is n['f_start'] // window_ticks.
+    """
+    window_ticks = bar_ticks * window_bars
+    by_window = defaultdict(list)
+    for n in notes:
+        by_window[n['f_start'] // window_ticks].append(n)
+    windows = sorted(by_window)
+
+    raw = {}
+    prev_estimate = fallback
+    for w in windows:
+        prev_estimate = estimate_split_pitch(by_window[w], fallback=prev_estimate)
+        raw[w] = prev_estimate
+
+    smoothed = {}
+    prev = None
+    for w in windows:
+        if prev is None:
+            smoothed[w] = raw[w]
+        else:
+            delta = max(-max_step, min(max_step, raw[w] - prev))
+            smoothed[w] = prev + delta
+        prev = smoothed[w]
+
+    return window_ticks, smoothed
+
+
+def assign_hands(notes, max_hand_span=16, ambiguity_zone=3):
+    """Refines the naive per-note treble/bass split -- each note already
+    carries n['_split_pitch'], the boundary its onset uses, from either
+    the fixed --split-pitch or compute_dynamic_split_points -- by looking
+    at each onset event (chord) as a whole instead of one note at a time.
+
+    Only notes within `ambiguity_zone` semitones of their onset's split
+    point are ever reconsidered; a note clearly above or below the line
+    is left exactly where the threshold put it. An ambiguous note is
+    moved to the other hand only if both hold:
+      (a) it sits closer to that hand's actual recent position -- the
+          pitch centroid of its own last onset -- than to its
+          naively-assigned hand's recent position. This is the "left
+          hand is already busy an octave lower" case: a boundary note
+          gets pulled toward whichever hand it's registrally closer to
+          given where that hand actually just was, not just the fixed
+          threshold;
+      (b) doing so doesn't push either hand's resulting pitch-cluster
+          for this onset past max_hand_span semitones -- a hand can't
+          physically stretch further than that regardless of what
+          continuity would prefer.
+
+    Mutates each note's new 'hand' field ('treble'/'bass'); doesn't
+    touch pitch, timing, or anything else. Returns (reassigned_count,
+    warnings) where warnings is a list of (onset, span) for onsets whose
+    FINAL assignment still leaves a hand spanning more than
+    max_hand_span semitones -- a real, unavoidable stretch the source
+    material has, not something reassignment could fix; surfaced as a
+    diagnostic; never auto-corrected further (there's no safe universal
+    fix -- could mean an arpeggiated read, a genuine two-hand chord
+    split some other way, or a transcription artifact).
+    """
+    if not notes:
+        return 0, []
+
+    by_onset = defaultdict(list)
+    for n in notes:
+        by_onset[n['f_start']].append(n)
+    onsets = sorted(by_onset)
+
+    for n in notes:
+        n['hand'] = 'treble' if n['pitch'] >= n['_split_pitch'] else 'bass'
+    naive = {id(n): n['hand'] for n in notes}
+
+    prev_centroid = {'treble': None, 'bass': None}
+    warnings = []
+    for onset in onsets:
+        event = by_onset[onset]
+        split = event[0]['_split_pitch']
+
+        for n in event:
+            if abs(n['pitch'] - split) > ambiguity_zone:
+                continue
+            other = 'bass' if n['hand'] == 'treble' else 'treble'
+            if prev_centroid[other] is None:
+                continue
+            dist_current = (abs(n['pitch'] - prev_centroid[n['hand']])
+                             if prev_centroid[n['hand']] is not None else 0)
+            dist_other = abs(n['pitch'] - prev_centroid[other])
+            if dist_other >= dist_current:
+                continue
+
+            trial = defaultdict(list)
+            for m in event:
+                h = other if m is n else m['hand']
+                trial[h].append(m['pitch'])
+            if all((max(v) - min(v)) <= max_hand_span for v in trial.values() if v):
+                n['hand'] = other
+
+        for hand in ('treble', 'bass'):
+            pitches = [n['pitch'] for n in event if n['hand'] == hand]
+            if pitches:
+                prev_centroid[hand] = sum(pitches) / len(pitches)
+                if (max(pitches) - min(pitches)) > max_hand_span:
+                    warnings.append((onset, max(pitches) - min(pitches)))
+
+    reassigned = sum(1 for n in notes if n['hand'] != naive[id(n)])
+    return reassigned, warnings
+
+
 def bar_diagnostics(notes, bar_ticks, top_n=10):
     """Per-bar rollup of the same signals report() already computes (chord
     conflicts, rests, heavy tie chains, cross-bar ties, invented sustain),
@@ -1155,6 +1298,48 @@ def bar_diagnostics(notes, bar_ticks, top_n=10):
 
     scored = [(bar, sum(c.values()), c) for bar, c in bars.items()]
     scored = [x for x in scored if x[1] > 0]
+    scored.sort(key=lambda x: (-x[1], x[0]))
+    return scored[:top_n]
+
+
+def confidence_warnings(notes, bar_ticks, hand_warnings=None, low_conf_threshold=0.3, top_n=10):
+    """Combines two experimental signals -- classify_voice_roles's
+    per-note confidence and assign_hands's span-violation warnings --
+    into a single per-bar view of where ScorePrep is least sure it made
+    the right call, rather than presenting every automated decision as
+    equally certain. A "here's where I might be wrong" readout, in the
+    spirit of the confidence-warnings idea from the feature brainstorm --
+    this is the version of it grounded in signals classify_voice_roles
+    and assign_hands actually compute, not a display gimmick with
+    invented-looking numbers behind it.
+
+    Operates on the full (pre-split) note list so it isn't limited to one
+    staff, since a hand-span violation by definition involves both. Pure
+    diagnostic -- doesn't change engraving output, and has no on/off
+    switch of its own since it can't make anything worse.
+
+    Returns [(bar, severity, low_conf_count, span_semitones)], worst
+    first, capped at top_n. A hand-span violation is weighted higher
+    than a handful of ambiguous voice-role calls -- an unplayable chord
+    is a bigger deal than uncertainty about which line is the melody.
+    """
+    by_bar_low_conf = defaultdict(int)
+    for n in notes:
+        if n.get('voice_confidence', 1.0) < low_conf_threshold:
+            by_bar_low_conf[n['f_start'] // bar_ticks] += 1
+
+    by_bar_span = defaultdict(int)
+    for onset, span in (hand_warnings or []):
+        bar = onset // bar_ticks
+        by_bar_span[bar] = max(by_bar_span[bar], span)
+
+    scored = []
+    for bar in set(by_bar_low_conf) | set(by_bar_span):
+        low_conf = by_bar_low_conf.get(bar, 0)
+        span = by_bar_span.get(bar, 0)
+        severity = span * 2 + low_conf
+        if severity > 0:
+            scored.append((bar, severity, low_conf, span))
     scored.sort(key=lambda x: (-x[1], x[0]))
     return scored[:top_n]
 
@@ -1253,7 +1438,9 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
         track_selector=None, channel_override=None, duration_style='dotted',
         min_velocity=0, velocity_mode='passthrough', velocity_scale=1.0,
         tie_weight=None, rest_weight=None, artic_weight=None,
-        preserve_source_duration=True, melody_preservation=False):
+        preserve_source_duration=True, melody_preservation=False,
+        dynamic_split=False, split_window_bars=8,
+        hand_assignment=False, max_hand_span=16, hand_ambiguity_zone=3):
     """Runs the full cleanup pipeline. Shared by --interactive and normal
     CLI-argument mode. tempo, split_pitch, and time_sig may be None, in
     which case they're estimated from the source file."""
@@ -1453,8 +1640,38 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
     resolve_note_durations(notes, temperature, bar_ticks)
     classify_voice_roles(notes)
 
-    treble = [n for n in notes if n['pitch'] >= split_pitch]
-    bass = [n for n in notes if n['pitch'] < split_pitch]
+    if dynamic_split:
+        window_ticks, split_points = compute_dynamic_split_points(
+            notes, bar_ticks, split_window_bars, fallback=split_pitch)
+        for n in notes:
+            n['_split_pitch'] = split_points[n['f_start'] // window_ticks]
+        vals = sorted(split_points.values())
+        print(f"dynamic-split=on -- split point re-estimated every {split_window_bars} bars "
+              f"({len(split_points)} window(s), range {vals[0]}-{vals[-1]}, "
+              f"median {vals[len(vals) // 2]}) instead of the fixed pitch {split_pitch}",
+              file=sys.stderr)
+    else:
+        for n in notes:
+            n['_split_pitch'] = split_pitch
+
+    if hand_assignment:
+        reassigned, hand_warnings = assign_hands(notes, max_hand_span, hand_ambiguity_zone)
+        print(f"hand-assignment=on -- {reassigned} note(s) reassigned across the naive "
+              f"treble/bass split based on chord context and hand continuity "
+              f"(max-hand-span={max_hand_span}, ambiguity-zone={hand_ambiguity_zone})",
+              file=sys.stderr)
+        if hand_warnings:
+            print(f"  {len(hand_warnings)} onset(s) still exceed max-hand-span even after "
+                  f"reassignment -- likely a genuine stretch in the source, not something "
+                  f"reassignment alone can fix; widest: {max(w for _, w in hand_warnings)} semitones",
+                  file=sys.stderr)
+    else:
+        for n in notes:
+            n['hand'] = 'treble' if n['pitch'] >= n['_split_pitch'] else 'bass'
+        hand_warnings = []
+
+    treble = [n for n in notes if n['hand'] == 'treble']
+    bass = [n for n in notes if n['hand'] == 'bass']
 
     tie_budget = tie_budget_for(temperature)
     weights = optimizer_weights(temperature, tie_weight, rest_weight, artic_weight)
@@ -1487,6 +1704,19 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
     print(f"Processed {len(notes)} notes -> treble {len(treble)}, bass {len(bass)}", file=sys.stderr)
     report('TREBLE', treble, bar_ticks, treble_opt_stats)
     report('BASS', bass, bar_ticks, bass_opt_stats)
+
+    conf_warnings = confidence_warnings(notes, bar_ticks, hand_warnings)
+    if conf_warnings:
+        print(f"\n===== Confidence Warnings (experimental) =====", file=sys.stderr)
+        print("(bars where the automated classifiers are least certain -- worth a look; "
+              "1-indexed)", file=sys.stderr)
+        for bar, severity, low_conf, span in conf_warnings:
+            parts = []
+            if low_conf:
+                parts.append(f"{low_conf} ambiguous melody/accompaniment call(s)")
+            if span:
+                parts.append(f"hand-span {span} semitones (exceeds --max-hand-span)")
+            print(f"  Measure {bar + 1}: {', '.join(parts)}", file=sys.stderr)
 
     treble_track = build_track(treble, 'Treble')
     bass_track = build_track(bass, 'Bass')
@@ -1871,8 +2101,41 @@ def interactive_mode():
         print("accompaniment gets the opposite (declutter more freely). Check the")
         print("report's Voice Roles section before trusting this on a given piece.")
         melody_preservation = _prompt_bool("Enable melody preservation?", default=False)
+
+        print("\nDynamic split: instead of one fixed treble/bass split pitch for the")
+        print("whole piece, re-estimate it every N bars so it follows the music's")
+        print("register drifting over time (e.g. a verse sitting lower than a chorus).")
+        dynamic_split = _prompt_bool("Enable dynamic split?", default=False)
+        split_window_bars = 8
+        if dynamic_split:
+            def valid_window(n):
+                return (n > 0, "Must be a positive number of bars.")
+            split_window_bars = _prompt("Window size in bars", default=8, cast=int,
+                                         validate=valid_window)
+
+        print("\nHand assignment [experimental]: within each chord, reconsider notes")
+        print("sitting close to the split point -- a note moves to the other hand if")
+        print("it's actually closer to that hand's recent position (e.g. \"the left")
+        print("hand is already busy an octave lower\") and doing so doesn't stretch")
+        print("either hand past its span limit. Notes not near the boundary are")
+        print("never touched; this only refines the split above, not replace it.")
+        hand_assignment = _prompt_bool("Enable hand assignment?", default=False)
+        max_hand_span, hand_ambiguity_zone = 16, 3
+        if hand_assignment:
+            def valid_nonneg(n):
+                return (n >= 0, "Must be zero or a positive number of semitones.")
+            max_hand_span = _prompt("Max hand span in semitones (16 = a 10th)",
+                                     default=16, cast=int, validate=valid_nonneg)
+            hand_ambiguity_zone = _prompt("Ambiguity zone in semitones (how close to the "
+                                           "split point counts as reconsiderable; 0 disables "
+                                           "reassignment)",
+                                           default=3, cast=int, validate=valid_nonneg)
     else:
         melody_preservation = False
+        dynamic_split = False
+        split_window_bars = 8
+        hand_assignment = False
+        max_hand_span, hand_ambiguity_zone = 16, 3
 
     print()
     run(input_path, output_path, tempo, split_pitch, temperature, time_sig,
@@ -1880,7 +2143,8 @@ def interactive_mode():
         ','.join(map(str, track_indices)), channel_override,
         duration_style, min_velocity, velocity_mode, velocity_scale,
         tie_weight, rest_weight, artic_weight, preserve_source_duration,
-        melody_preservation)
+        melody_preservation, dynamic_split, split_window_bars,
+        hand_assignment, max_hand_span, hand_ambiguity_zone)
 
 
 def main():
@@ -2004,6 +2268,35 @@ def main():
                           'opposite (declutter more freely). Built on a still-experimental '
                           'classifier; check the Voice Roles section of the report before '
                           'trusting this on a given piece.')
+    ap.add_argument('--dynamic-split', choices=['on', 'off'], default='off',
+                     help='"off" (default): one fixed --split-pitch for the whole piece. "on": '
+                          're-estimate the treble/bass split every --split-window-bars bars '
+                          'instead, so the split follows the music\'s register drifting over '
+                          'time (e.g. a verse sitting lower than a chorus) rather than forcing '
+                          'one compromise split for the entire piece. --split-pitch (given or '
+                          'auto-estimated) is used as the starting fallback for windows too '
+                          'sparse to estimate their own.')
+    ap.add_argument('--split-window-bars', type=int, default=8, metavar='N',
+                     help='Window size in bars for --dynamic-split. Default: 8. Ignored unless '
+                          '--dynamic-split on.')
+    ap.add_argument('--hand-assignment', choices=['on', 'off'], default='off',
+                     help='[experimental] "off" (default): a note goes to treble/bass purely by '
+                          'which side of the split pitch it falls on. "on": within each chord, '
+                          'reconsider notes sitting close to the split point -- a note is moved '
+                          'to the other hand if it\'s actually closer to that hand\'s recent '
+                          'position (e.g. "the left hand is already busy an octave lower") and '
+                          'doing so doesn\'t stretch either hand past --max-hand-span. Notes not '
+                          'near the boundary are never touched. Composes with --split-pitch or '
+                          '--dynamic-split, whichever is set -- this only refines their boundary, '
+                          'it doesn\'t replace it.')
+    ap.add_argument('--max-hand-span', type=int, default=16, metavar='SEMITONES',
+                     help='Widest pitch span (in semitones) --hand-assignment will allow within '
+                          'one hand\'s notes at a single onset. Default: 16 (a 10th). 0 means no '
+                          'chord at all fits in one hand -- every onset gets flagged. Onsets that '
+                          'exceed this even after reassignment are reported, not auto-fixed.')
+    ap.add_argument('--hand-ambiguity-zone', type=int, default=3, metavar='SEMITONES',
+                     help='How close (in semitones) to the split point a note has to be before '
+                          '--hand-assignment will reconsider it. Default: 3.')
     if pre_args.profile:
         ap.set_defaults(**PROFILES[pre_args.profile])
     args = ap.parse_args()
@@ -2026,12 +2319,21 @@ def main():
         except ValueError as e:
             ap.error(f"--time-sig: {e}")
 
+    if args.split_window_bars <= 0:
+        ap.error("--split-window-bars must be a positive number of bars")
+    if args.max_hand_span < 0:
+        ap.error("--max-hand-span must be zero or a positive number of semitones")
+    if args.hand_ambiguity_zone < 0:
+        ap.error("--hand-ambiguity-zone must be zero or a positive number of semitones")
+
     run(args.input, args.output, args.tempo, args.split_pitch, args.tie_temperature, time_sig,
         args.pedal_mode, args.min_note_ticks, args.playback_sustain == 'on', args.grid,
         args.track, args.channel, args.clean_durations, args.min_velocity,
         args.velocity_mode, args.velocity_scale,
         args.tie_weight, args.rest_weight, args.articulation_weight,
-        args.tempo_rescale == 'preserve-duration', args.melody_preservation == 'on')
+        args.tempo_rescale == 'preserve-duration', args.melody_preservation == 'on',
+        args.dynamic_split == 'on', args.split_window_bars,
+        args.hand_assignment == 'on', args.max_hand_span, args.hand_ambiguity_zone)
 
 
 if __name__ == '__main__':

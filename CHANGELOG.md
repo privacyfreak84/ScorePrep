@@ -3,6 +3,71 @@
 All notable changes to ScorePrep are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.6]
+
+### Added
+
+- The diagnostic report now ends with a "Confidence Warnings" section
+  listing the bars where the experimental classifiers are least sure of
+  themselves -- combining low-confidence melody/accompaniment calls with
+  any hand-span violations from `--hand-assignment` into one "here's
+  where I might be wrong" view, worst first. No switch to turn on --
+  it's pure diagnostics, always shown when there's something worth
+  flagging, and can't change engraving output.
+
+### Fixed
+
+- `hand_warnings` could be referenced before assignment when
+  `--hand-assignment` was off, a latent bug from when that feature was
+  added -- caught while wiring up the confidence-warnings section above,
+  no observable effect before now since nothing read it in that path.
+- `--split-window-bars 0` (or negative) crashed with a raw
+  ZeroDivisionError instead of a clear error message. Negative
+  `--max-hand-span`/`--hand-ambiguity-zone` were silently accepted
+  instead of rejected. All three now validate up front with a proper
+  error message; found via stress-testing the new experimental features
+  against invalid/boundary inputs before shipping them.
+- The duration optimizer was undercounting how many tied noteheads a note
+  crossing a barline would actually need, for any tie-temperature above
+  0.0. It assumed a barline split always costs exactly one extra
+  notehead, but a split forces the pre-barline segment to whatever's
+  left until the barline -- which is often not a clean note value even
+  when the note's full duration would have been, and that remainder can
+  need extra noteheads of its own. In practice this meant some candidate
+  durations looked cheaper than they really were, so the optimizer
+  occasionally chose more cross-bar-tied notation than your
+  tie-temperature setting actually called for. Fixed by having it
+  properly split the note at each barline and count each resulting
+  piece on its own. Net effect on a real test piece: noticeably fewer
+  cross-bar ties at the same tie-temperature (e.g. TT 0.15: 230->178 and
+  286->199 across the two staves), i.e. cleaner notation than before at
+  the same settings.
+
+### Added
+
+- `--hand-assignment on` [experimental] reconsiders notes sitting close
+  to the treble/bass split point within each chord, instead of assigning
+  every note purely by which side of the line it falls on. A boundary
+  note moves to the other hand if it's actually closer to that hand's
+  recent position than to its naively-assigned hand's (e.g. "the left
+  hand is already busy an octave lower"), and only if doing so doesn't
+  stretch either hand's chord past `--max-hand-span` (default 16
+  semitones, a 10th). Notes not near the boundary are never touched.
+  Composes with either a fixed `--split-pitch` or `--dynamic-split` --
+  refines whichever boundary is already in place rather than replacing
+  it. Onsets that still need more than one hand's reach even after
+  reassignment are reported as a real, unavoidable stretch rather than
+  guessed at further. Off by default; available in interactive mode's
+  advanced options too.
+- `--dynamic-split on` re-estimates the treble/bass split point every
+  `--split-window-bars` bars (default 8) instead of using one fixed
+  split for the whole piece, so the split follows the music's register
+  drifting over time (e.g. a verse sitting lower than a chorus). Off by
+  default. A sparse window falls back to the previous window's split
+  rather than a fresh guess, and the per-window change is capped at 4
+  semitones, so it drifts instead of jumping around. Available in
+  interactive mode's advanced options too.
+
 ## [1.2.5]
 
 ### Added
