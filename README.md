@@ -3,7 +3,7 @@
 **Clean AI-generated piano MIDI for beautiful MuseScore engraving.**
 
 ```
-python3 scoreprep.py transcription.mid clean.mid --tempo 130
+python3 ScorePrep.py transcription.mid clean.mid --tempo 130
 ```
 
 ---
@@ -13,7 +13,7 @@ python3 scoreprep.py transcription.mid clean.mid --tempo 130
 <!-- TODO: screenshots
 Original AI transcription (MuseScore import) → mess of ties, one staff, fractured chords
                     ↓
-After scoreprep.py  → clean two-staff grand staff, minimal ties, correct engraving
+After ScorePrep.py  → clean two-staff grand staff, minimal ties, correct engraving
 -->
 
 *(screenshots coming soon)*
@@ -66,7 +66,7 @@ have a trustworthy one) is the expected common case.
 - Tempo estimation: source file's own tempo → rhythm-pattern estimate →
   120 BPM fallback, with transparent reasoning printed at every step
 - Time signature: read from the source, or `--time-sig`
-- Interactive step-by-step mode — just run `scoreprep.py` with no
+- Interactive step-by-step mode — just run `ScorePrep.py` with no
   arguments
 
 ### Musical cleanup
@@ -110,11 +110,13 @@ have a trustworthy one) is the expected common case.
   sixteenths invented)` alongside `needs-tie` — both halves of the
   tie/rest tradeoff, plus exactly how much sustain the optimizer
   fabricated to get there, visible in one place.
-- **Barline-aware tie counting** — a note spanning a barline needs an
-  extra tied notehead no matter how "clean" its duration value is
-  (MuseScore can't draw one notehead straddling a barline). Every
-  tie-budget check now accounts for this, so `needs-tie` and the
-  optimizer's own decisions are never off by an uncounted tie.
+- **Barline-aware tie counting** — a note spanning a barline can't be
+  drawn as one notehead straddling it, and splitting at the barline can
+  leave a remainder that itself needs more than one further notehead
+  (not just one extra, as an earlier version of this assumed). Every
+  tie-budget check properly decomposes each barline-split segment, so
+  `needs-tie` and the optimizer's own decisions are never off by an
+  uncounted tie.
 - **`--track` / `--channel`** — manual override for multi-instrument
   source files, with automatic-pick transparency (which track, why,
   and a warning if another track has a comparable note count).
@@ -135,23 +137,53 @@ have a trustworthy one) is the expected common case.
 - Confidence messages throughout: every auto-estimated value explains
   what it picked and why, so nothing is a silent guess
 
+### Experimental
+
+Off by default, built on a heuristic melody/accompaniment classifier
+(`classify_voice_roles`) — validate against a piece you know well before
+trusting these:
+
+- **`--profile {readable,balanced,faithful}`** — sets `--tie-temperature`,
+  `--pedal-mode`, `--grid`, and `--clean-durations` together instead of
+  tuning them individually. `balanced` is the benchmark-tested sweet
+  spot (see the benchmark suite for methodology)
+- **`--melody-preservation on`** — biases the duration optimizer per
+  note by voice role: melody gets cheaper ties/costlier rests
+  (protect continuity), accompaniment gets the opposite (declutter
+  more freely)
+- **`--dynamic-split on`** — re-estimates the treble/bass split every
+  `--split-window-bars` bars instead of one fixed split for the whole
+  piece, so it follows the music's register drifting over time
+- **`--hand-assignment on`** — within each chord, reconsiders notes
+  near the split point and moves a note to the other hand if it's
+  actually closer to that hand's recent position and doing so doesn't
+  exceed `--max-hand-span`
+- The diagnostic report also gains three sections regardless of which
+  experimental flags are on: **"Measures Needing Attention"** (bars with
+  the most chord conflicts/rests/heavy ties, worth a manual look),
+  **"Voice Roles"** (the melody/accompaniment split and confidence per
+  staff), and **"Confidence Warnings"** (bars where the classifiers are
+  least sure of themselves — combines voice-role confidence with any
+  `--hand-assignment` span violations). All three are read-only; none
+  of them change engraving output by themselves.
+
 ## Examples
 
 ```bash
 # Basic — estimate everything
-python3 scoreprep.py transcription.mid clean.mid
+python3 ScorePrep.py transcription.mid clean.mid
 
 # Literal engraving — closest to the source's exact timing
-python3 scoreprep.py transcription.mid clean.mid --tie-temperature 1.0
+python3 ScorePrep.py transcription.mid clean.mid --tie-temperature 1.0
 
 # Triplet-heavy transcription
-python3 scoreprep.py transcription.mid clean.mid --grid triplet
+python3 ScorePrep.py transcription.mid clean.mid --grid triplet
 
 # Multi-track source, piano is track 2
-python3 scoreprep.py transcription.mid clean.mid --track 2
+python3 ScorePrep.py transcription.mid clean.mid --track 2
 
 # Interactive, step-by-step
-python3 scoreprep.py
+python3 ScorePrep.py
 ```
 
 ## Installation
@@ -160,7 +192,7 @@ Requires Python 3 and [`mido`](https://pypi.org/project/mido/):
 
 ```bash
 pip install mido
-python3 scoreprep.py --help
+python3 ScorePrep.py --help
 ```
 
 ## Advanced options
@@ -187,9 +219,17 @@ python3 scoreprep.py --help
 | `--rest-weight` | [advanced] override the optimizer's cost for leaving a visible rest. Default: `1.0` |
 | `--articulation-weight` | [advanced] override the optimizer's cost per grid unit of invented sustain. Default: derived from `--tie-temperature` |
 | `--channel N` | Restrict the chosen track to one MIDI channel |
+| `--tempo-rescale {preserve-duration,change-speed}` | When `--tempo` overrides the source's own tempo: rescale ticks to keep real-world length (default), or leave ticks as-is so playback speed genuinely changes |
+| `--profile {readable,balanced,faithful}` | [experimental] Sets `--tie-temperature`, `--pedal-mode`, `--grid`, and `--clean-durations` together. Any of those four given explicitly still overrides the profile's value for it |
+| `--melody-preservation {on,off}` | [experimental] Biases the duration optimizer per note using the heuristic voice-role classifier — cheaper ties/costlier rests for likely melody, the reverse for likely accompaniment. Default: `off` |
+| `--dynamic-split {on,off}` | [experimental] Re-estimates the treble/bass split every `--split-window-bars` bars instead of using one fixed split for the whole piece. Default: `off` |
+| `--split-window-bars N` | Window size (in bars) for `--dynamic-split`. Default: `8` |
+| `--hand-assignment {on,off}` | [experimental] Within each chord, reconsiders notes near the split point and moves them to whichever hand they're actually closer to, if doing so doesn't exceed `--max-hand-span`. Default: `off` |
+| `--max-hand-span N` | Widest pitch span (semitones) `--hand-assignment` allows within one hand's chord. Default: `16` (a 10th) |
+| `--hand-ambiguity-zone N` | How close (semitones) to the split point a note must be before `--hand-assignment` reconsiders it. Default: `3` |
 | `--interactive` | Force step-by-step prompts |
 
-Run `scoreprep.py --help` for full, current wording on every flag.
+Run `ScorePrep.py --help` for full, current wording on every flag.
 </details>
 
 ## FAQ
@@ -272,7 +312,9 @@ Not promising a big list — just what's actively being considered next:
 - Same-pitch overlap priority (truncate earlier vs. delay later note)
 - Instrument/channel assignment on output (`program_change`)
 - Custom track naming
-- Voice-role-aware duration optimization (melody vs. accompaniment) — pending benchmark evidence, not yet justified
+- Validating the experimental voice-role-based features (`--melody-preservation`,
+  `--dynamic-split`, `--hand-assignment`) against real pieces before considering
+  any of them stable or on by default
 - Exact repeat detection (post-quantization measure hashing, velocity excluded) + 1st/2nd-ending suggestion as a direct extension — optional, user-confirmed, not auto-applied; explicitly excludes fuzzy/ornamented/transposed repeat matching
 
 ## Changelog
