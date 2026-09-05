@@ -3,6 +3,106 @@
 All notable changes to ScorePrep are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.7]
+
+### Fixed
+
+- **`--grid triplet` made the optimizer far too reluctant to sustain
+  notes, sounding rushed/choppy ("accelerated").** `artic_weight`'s cost
+  is documented as being per *sixteenth-equivalent* of invented duration,
+  but was actually applied per raw grid unit -- fine under the default
+  straight grid (a grid unit *is* a sixteenth there), but triplet mode's
+  grid unit is 3x finer, so the same absolute extension counted as 3x
+  more units and cost 3x more, making the optimizer choose far more
+  short/truncated notes with visible rests instead of natural sustain,
+  for no musical reason -- purely an accident of which grid happened to
+  be selected. Fixed by normalizing the fabrication cost by the grid's
+  scale factor. Found via a real piece: total invented-sustain duration
+  under `--grid triplet` went from being ~12x lower than the equivalent
+  `--grid straight` run (should be roughly comparable) to ~2x lower,
+  with the remaining gap explained by the finer grid legitimately being
+  able to close gaps more precisely rather than any remaining bias.
+  Confirmed byte-identical no-op for `--grid straight` (the default),
+  since its scale factor is 1 -- verified across both benchmark pieces
+  and the full tie-temperature/experimental-flag matrix.
+
+- **Non-384-PPQ sources were silently misquantized.** Every tick position
+  was read straight off the source file and fed into grid/bar math that
+  assumes `TICKS_PER_BEAT=384`, with no actual rescaling -- the existing
+  `NOTE: ... results may be off` warning undersold it badly. For a
+  480-PPQ source (a common DAW/export default) this meant a ~25% timing
+  distortion that *compounds* over the piece, since grid snapping doesn't
+  fail gracefully: what should be one beat gets treated as 1.25 beats,
+  every single onset. Found via a real piece (480 PPQ) that came out
+  "slow in some places, fast in others, not on time at all" -- root
+  cause wasn't tuplets as first suspected, it was this. Fixed by
+  rescaling every extracted tick (notes, sustain-pedal CC64 intervals)
+  by `TICKS_PER_BEAT / source_ticks_per_beat` right at load time, so
+  everything downstream operates in a consistent internal tick space
+  regardless of the source's own PPQ. Confirmed on the real piece: beat
+  count and real-world playback length now match the source to within
+  quantization rounding (previously off by 46%). Zero effect on
+  already-384-PPQ sources -- confirmed byte-identical against prior
+  output across both benchmark pieces, full TT sweep, all experimental
+  flag combinations.
+- Removed `fix_same_pitch_overlaps` and the redundant duration-optimizer
+  pass that followed it. `optimize_staff_durations` already bounds every
+  note's ceiling by its own next same-pitch onset, so same-pitch overlaps
+  were never actually possible after its first pass -- the "fix" step was
+  misfiring on true unisons (two notes of the same pitch starting at the
+  same instant) instead, truncating one of them to a single grid tick,
+  which the following optimizer pass then silently overwrote back to the
+  correct value. Net effect on real output: none -- confirmed
+  byte-identical against the prior behavior across both benchmark pieces,
+  a synthetic unison-heavy stress file, the full tie-temperature sweep,
+  and every experimental flag combination. Slightly faster (one fewer
+  full pass per staff) and removes a dead-code trap for future changes.
+
+### Added
+
+- `--tuplet-detection auto|off` (default `off`, same experimental/
+  unvalidated status as `--melody-preservation`/`--dynamic-split`/
+  `--hand-assignment`). Finds local n-tuplet bursts (quintuplets,
+  septuplets, nontuplets, etc. against a 1- or 2-beat span) directly in
+  the source, independent of `--grid`, and snaps just those onsets to
+  *exact* even division instead of letting each one round independently
+  to the outer straight/triplet grid. Doubles as the auto-detection this
+  was originally scoped alongside: choosing the right subdivision locally
+  per onset-cluster is a strictly better fit than one global grid choice
+  for the whole piece, and directly replaces most of the reason to reach
+  for `--grid triplet` manually. Full design: `docs/tuplet-detection-design.md`.
+
+  Motivated by, and validated against, a real piece's ~9-onset burst that
+  used to quantize to jagged durations (64/64/96/64/96/96/128/96/128/160
+  ticks) despite the overall span being correct -- with detection on, the
+  first 5 of those 9 onsets now resolve to a clean, even ~77 ticks each.
+  Calibration note: an early version's fit-tolerance scaled with
+  `span/N`, which structurally favors smaller N (more absolute slack for
+  the same span) regardless of what's actually in the piece -- caught
+  empirically when quintuplets dominated detections even on pieces with
+  no independent evidence of being tuplet-heavy. Replaced with a fixed
+  24-tick tolerance, calibrated against real data: a piece independently
+  confirmed tuplet-dense (via its own notated score) shows 38 detected
+  groups at this threshold, versus 7 and 0 on two pieces with no such
+  evidence -- the best calibration signal available without ground-truth
+  tuplet annotations for every benchmark piece. `benchmark_experimental.py`
+  extended with a fourth `tuplet` feature for real A/B validation.
+  Confirmed `off` (default) is byte-identical to pre-existing output;
+  `auto` runs clean across the full TT/grid/experimental-flag matrix.
+  Known v1 limitation: greedy left-to-right matching can settle for a
+  partial group (e.g. 5-of-9) instead of holding out for a better
+  whole-group fit -- named in the design doc, not a new surprise.
+
+- Full tempo-track passthrough. Previously only the *first* `set_tempo`
+  message in the source was read, and the output always got one flat
+  tempo marking for the whole piece -- any rubato/local tempo changes in
+  the source were silently discarded (contributing to the same "not on
+  time" symptom above, alongside the PPQ bug). Now, when `--tempo` isn't
+  given explicitly and the source has more than one genuine tempo event,
+  the full curve is preserved in the output instead of flattened.
+  Explicit `--tempo` still means one flat tempo, as before, to avoid
+  ambiguity about what "override one value out of a dozen" should mean.
+
 ## [1.2.6.n]
 
 ### Added

@@ -193,16 +193,17 @@ def _clean_for(grid_mode, duration_style):
 GRID = GRID_MODES['straight']['grid']
 CLEAN = _clean_for('straight', 'dotted')
 GRID_UNIT_NAME = GRID_MODES['straight']['unit_name']
+GRID_SCALE = GRID_MODES['straight']['scale']
 
 
 def configure_grid(mode, duration_style='dotted'):
     """Switch the module-level GRID/CLEAN used by every quantization step
     (quantize, resolve_note_durations, optimize_staff_durations,
-    fix_same_pitch_overlaps, minimal_tie_count, ...). mode: 'straight' or
+    minimal_tie_count, ...). mode: 'straight' or
     'triplet'. duration_style: 'dotted' (default, includes dotted values)
     or 'powers2' (plain power-of-two note values only). Must be called
     before any of those run."""
-    global GRID, CLEAN, GRID_UNIT_NAME
+    global GRID, CLEAN, GRID_UNIT_NAME, GRID_SCALE
     if mode not in GRID_MODES:
         raise ValueError(f"Unknown grid mode: {mode!r} (expected one of {list(GRID_MODES)})")
     if duration_style not in ('dotted', 'powers2'):
@@ -210,6 +211,7 @@ def configure_grid(mode, duration_style='dotted'):
     GRID = GRID_MODES[mode]['grid']
     CLEAN = _clean_for(mode, duration_style)
     GRID_UNIT_NAME = GRID_MODES[mode]['unit_name']
+    GRID_SCALE = GRID_MODES[mode]['scale']
     _tie_count_cache.clear()
 
 
@@ -423,10 +425,9 @@ _tie_count_cache = {}
 
 def tie_budget_for(temperature):
     """Same tie-budget formula resolve_note_durations uses, factored out
-    so any later step that re-shortens a note (e.g. fix_same_pitch_overlaps)
-    can re-snap to a value within the same budget instead of accidentally
-    producing a duration that needs more ties than the chosen temperature
-    allows."""
+    so any later step that re-shortens a note can re-snap to a value
+    within the same budget instead of accidentally producing a duration
+    that needs more ties than the chosen temperature allows."""
     temperature = max(0.0, min(1.0, temperature))
     return 1 + round(temperature * 4)
 
@@ -539,6 +540,97 @@ def optimizer_weights(temperature, tie_weight=None, rest_weight=None, artic_weig
     )
 
 
+TUPLET_CANDIDATES = (5, 7, 9, 10, 11)
+TUPLET_SPANS_BEATS = (1, 2)
+# Fixed absolute-tick tolerance, NOT a fraction of span/N: an earlier
+# version used avg_error <= FRACTION * (span/N), but that gives smaller N
+# strictly more absolute tick slack than larger N for the same span
+# (span/N is bigger when N is smaller) -- structurally biasing detection
+# toward quintuplets regardless of what's actually in the piece, borne
+# out empirically (quintuplets dominated every N-distribution tested,
+# even on pieces with no independent evidence of being tuplet-heavy). A
+# fixed tick budget applies the same absolute bar to every candidate N.
+# 24 ticks (~a 64th note) was chosen from real data: at this tolerance,
+# a piece independently known to be tuplet-dense (confirmed via its own
+# hand-notated score showing tuplet brackets in nearly every bar) shows
+# 5-12x more detected groups than two pieces with no such evidence --
+# the strongest calibration signal available without ground-truth
+# tuplet annotations for every benchmark piece.
+TUPLET_FIT_TOLERANCE_TICKS = 24
+
+
+def detect_tuplet_groups(notes):
+    """Find local n-tuplet bursts (5/6/7/9/10/11-against-1-or-2-beats)
+    directly in the raw, unquantized tick stream -- before any grid
+    quantization or treble/bass split, since a real tuplet run can
+    straddle both hands and either step could otherwise sever a group
+    before it's ever recognized. See docs/tuplet-detection-design.md.
+
+    Deliberately excludes N in {2,3,4,8}: straight/triplet grids already
+    represent those natively and shouldn't be second-guessed here.
+
+    A genuine hit gets its member onsets snapped to *exact* even
+    division (ideal_tick = start + round(k * span / N)) instead of each
+    one rounding independently to the outer grid -- that's specifically
+    what fixes the uneven-duration artifact independent per-note
+    grid-snapping produces on real tuplet material. Tags each accepted
+    member with '_tuplet'=True and pre-fills 'f_start'/'f_end' with its
+    exact evenly-divided tick span; resolve_note_durations and
+    optimize_staff_durations both skip their normal cap/cost-search
+    logic for a tagged note and leave these values untouched -- a
+    tuplet member's duration is "its even share of the group", not a
+    cost-optimal or evidence-capped choice.
+
+    Requires an EXACT onset-count match against a candidate window (no
+    partial-fill tolerance) and a strict average-fit-error threshold, so
+    coincidental fast-but-not-tuplet clustering (grace-note runs,
+    trills, glissandi) falls through untouched to normal quantization --
+    a wrong tuplet call reads worse than no tuplet call at all. Greedy,
+    left-to-right, non-overlapping: a later, better-fitting grouping
+    starting inside an already-accepted one is never reconsidered
+    (acceptable v1 heuristic, see design doc).
+
+    Mutates notes in place. Returns the number of groups found (for the
+    run() log line only)."""
+    if not notes:
+        return 0
+
+    by_onset = defaultdict(list)
+    for n in notes:
+        by_onset[n['start']].append(n)
+    starts = sorted(by_onset)
+
+    used = set()
+    group_count = 0
+    for i, start in enumerate(starts):
+        if start in used:
+            continue
+        best = None  # (avg_error, n_cand, group_starts)
+        for span_beats in TUPLET_SPANS_BEATS:
+            span = span_beats * TICKS_PER_BEAT
+            window_end = start + span
+            window_starts = [s for s in starts[i:] if s < window_end and s not in used]
+            for n_cand in TUPLET_CANDIDATES:
+                if len(window_starts) != n_cand:
+                    continue
+                ideal = [start + round(k * span / n_cand) for k in range(n_cand)]
+                avg_error = sum(abs(a - b) for a, b in zip(window_starts, ideal)) / n_cand
+                if avg_error <= TUPLET_FIT_TOLERANCE_TICKS and (best is None or avg_error < best[0]):
+                    best = (avg_error, n_cand, span, window_starts)
+        if best is not None:
+            _, n_cand, span, group_starts = best
+            group_start = group_starts[0]
+            ideal_ticks = [group_start + round(k * span / n_cand) for k in range(n_cand + 1)]
+            for k, s in enumerate(group_starts):
+                for n in by_onset[s]:
+                    n['_tuplet'] = True
+                    n['_tuplet_start'] = ideal_ticks[k]
+                    n['_tuplet_end'] = ideal_ticks[k + 1]
+                used.add(s)
+            group_count += 1
+    return group_count
+
+
 def resolve_note_durations(notes, temperature=0.0, bar_ticks=None):
     """Quantize onsets and cap each note's *maximum possible* duration at
     a temperature-scaled bar span and tie budget -- this is the "real
@@ -558,6 +650,17 @@ def resolve_note_durations(notes, temperature=0.0, bar_ticks=None):
     tie_budget = tie_budget_for(temperature)
 
     for n in notes:
+        if n.get('_tuplet'):
+            # already evenly divided by detect_tuplet_groups -- skip the
+            # normal grid-quantize/bar-cap/tie-budget logic entirely,
+            # since imposing any of that here would just reintroduce the
+            # unevenness detection was built to remove
+            n['f_start'] = n['_tuplet_start']
+            n['f_end'] = n['_tuplet_end']
+            n['nat_units'] = max(1, round((n['_tuplet_end'] - n['_tuplet_start']) / GRID))
+            n['natural_end'] = n['f_end']
+            continue
+
         q_start = quantize(n['start'])
         raw_end = max(q_start + GRID, quantize(n['end']))
         raw_dur = raw_end - q_start
@@ -723,6 +826,12 @@ def optimize_staff_durations(notes, temperature, bar_ticks, weights=None, stats=
         by_onset[n['f_start']].append(n)
 
     for onset, event in by_onset.items():
+        if all(n.get('_tuplet') for n in event):
+            # already evenly divided and f_end already set by
+            # resolve_note_durations -- the whole point is even
+            # division, not a cost-optimal choice, so leave it alone
+            continue
+
         bar_start = (onset // bar_ticks) * bar_ticks
         bar_room_units = max(1, (bar_start + max_bars * bar_ticks - onset) // GRID)
         next_onset = next_onset_after.get(onset)
@@ -763,9 +872,19 @@ def optimize_staff_durations(notes, temperature, bar_ticks, weights=None, stats=
                 continue
             rest_present = next_onset_units is not None and v < next_onset_units
             fabrication = sum(max(0, v - nat) for nat in member_nat_units)
+            # artic_w is calibrated per *sixteenth-equivalent* of invented
+            # duration (see optimizer_weights docstring), but fabrication
+            # is counted in raw grid units -- under --grid triplet those
+            # are 3x finer than a sixteenth, so the same absolute stretch
+            # would otherwise cost 3x more than intended, making the
+            # optimizer far more reluctant to extend notes (more/shorter
+            # notes, more rests) for no musical reason, purely because of
+            # which grid happened to be selected. Dividing by GRID_SCALE
+            # re-expresses it in sixteenth-equivalents so temperature
+            # means the same thing in either grid mode.
             cost = (eff_tie_w * max(0, tc - baseline_tc)
                     + eff_rest_w * (len(event) if rest_present else 0)
-                    + artic_w * fabrication)
+                    + artic_w * fabrication / GRID_SCALE)
             if best_cost is None or cost < best_cost or (cost == best_cost and fabrication < best_fab):
                 best_v, best_cost, best_fab = v, cost, fabrication
 
@@ -787,31 +906,6 @@ def optimize_staff_durations(notes, temperature, bar_ticks, weights=None, stats=
                 else:
                     cat = 'exact_no_rest'
                 stats[cat] = stats.get(cat, 0) + 1
-
-
-def fix_same_pitch_overlaps(notes, tie_budget=1, bar_ticks=None):
-    """Prevent a pitch's note-off happening after the next note-on of the
-    same pitch (can happen after rounding).
-
-    Truncating to the next onset produces an arbitrary tick, not
-    necessarily one of the "clean" durations resolve_note_durations chose
-    -- left alone, that can silently need more tied noteheads than the
-    requested tie_budget allows (invisible until something actually counts
-    ties). So after truncating, re-snap down to the largest duration that
-    still respects tie_budget (accounting for barline crossings when
-    bar_ticks is given); this can only shorten further, so it can't
-    reopen the overlap just fixed."""
-    by_pitch = defaultdict(list)
-    for n in notes:
-        by_pitch[n['pitch']].append(n)
-    for pitch, lst in by_pitch.items():
-        lst.sort(key=lambda n: n['f_start'])
-        for i in range(len(lst) - 1):
-            if lst[i]['f_end'] > lst[i + 1]['f_start']:
-                start = lst[i]['f_start']
-                truncated_units = max(1, (lst[i + 1]['f_start'] - start) // GRID)
-                final_units = best_units_within_budget(truncated_units, tie_budget, start, bar_ticks)
-                lst[i]['f_end'] = start + final_units * GRID
 
 
 def build_track(notes, name):
@@ -970,6 +1064,47 @@ def detect_source_tempo(mid):
                 is_generic = (msg.tempo == 500000)
                 return bpm, is_generic
     return None, False
+
+
+def read_tempo_curve(mid, tick_scale=1.0):
+    """Every set_tempo message across all tracks, absolute tick positions
+    rescaled into the internal TICKS_PER_BEAT space (see tick_scale in
+    run()) and merged/sorted by tick. Returns [(tick, raw_tempo), ...]
+    where raw_tempo is microseconds-per-beat (mido's native unit, ready
+    to hand straight to a MetaMessage). A source with only ONE tempo
+    event that's byte-identical to the untouched MIDI spec default
+    (500000 microsec/beat = 120 BPM -- see detect_source_tempo) is
+    treated the same as having no real tempo info at all and returns [];
+    a genuine multi-event curve is kept even if one of its events happens
+    to also be exactly 120 BPM."""
+    events = {}
+    for trk in mid.tracks:
+        abs_t = 0
+        for msg in trk:
+            abs_t += msg.time
+            if msg.type == 'set_tempo':
+                events[round(abs_t * tick_scale)] = msg.tempo
+    if not events:
+        return []
+    curve = sorted(events.items())
+    if len(curve) == 1 and curve[0][1] == 500000:
+        return []
+    return curve
+
+
+def rebase_tempo_curve(curve, leading_offset):
+    """Shift a read_tempo_curve() result to start at the same zero-point
+    as leading-silence-rebased notes. Events at or before leading_offset
+    are dropped except the last one -- whichever tempo was actually in
+    effect at the moment the piece now starts -- which becomes the new
+    tick-0 event, so playback never loses track of "what tempo are we
+    even at" right as the rebased piece begins."""
+    if leading_offset <= 0 or not curve:
+        return curve
+    before = [(t, v) for t, v in curve if t <= leading_offset]
+    after = [(t - leading_offset, v) for t, v in curve if t > leading_offset]
+    carried = before[-1][1] if before else curve[0][1]
+    return [(0, carried)] + after
 
 
 def describe_tempo_ambiguity(ranked_candidates):
@@ -1440,7 +1575,8 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
         tie_weight=None, rest_weight=None, artic_weight=None,
         preserve_source_duration=True, melody_preservation=False,
         dynamic_split=False, split_window_bars=8,
-        hand_assignment=False, max_hand_span=16, hand_ambiguity_zone=3):
+        hand_assignment=False, max_hand_span=16, hand_ambiguity_zone=3,
+        tuplet_detection='off'):
     """Runs the full cleanup pipeline. Shared by --interactive and normal
     CLI-argument mode. tempo, split_pitch, and time_sig may be None, in
     which case they're estimated from the source file."""
@@ -1464,8 +1600,12 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
     except Exception as e:
         sys.exit(f"Error: '{input_path}' doesn't look like a valid MIDI file ({e})")
     if mid.ticks_per_beat != TICKS_PER_BEAT:
-        print(f"NOTE: source ticks_per_beat={mid.ticks_per_beat}, expected {TICKS_PER_BEAT}. "
-              f"Grid/bar math assumes {TICKS_PER_BEAT}; results may be off.", file=sys.stderr)
+        tick_scale = TICKS_PER_BEAT / mid.ticks_per_beat
+        print(f"NOTE: source ticks_per_beat={mid.ticks_per_beat} (this script's internal grid "
+              f"is {TICKS_PER_BEAT}) -- rescaling every extracted tick position by "
+              f"{tick_scale:.4f}x so grid/bar/tempo math stays correct.", file=sys.stderr)
+    else:
+        tick_scale = 1.0
 
     track_summary = summarize_tracks(mid)
     if track_selector is not None:
@@ -1511,6 +1651,10 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
     for t in track_indices:
         notes.extend(extract_notes(mid.tracks[t], channel=channel_override))
     notes.sort(key=lambda n: (n['start'], n['pitch']))
+    if tick_scale != 1.0:
+        for n in notes:
+            n['start'] = round(n['start'] * tick_scale)
+            n['end'] = round(n['end'] * tick_scale)
     if not notes:
         listing = "\n".join(
             f"  track {i}: {c} note_on event(s){f', name \"{n}\"' if n else ''}"
@@ -1561,6 +1705,8 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
 
     if pedal_mode == 'reflect':
         pedal_intervals = read_pedal_intervals(mid)
+        if tick_scale != 1.0:
+            pedal_intervals = [(round(d * tick_scale), round(u * tick_scale)) for d, u in pedal_intervals]
         if leading_offset > 0:
             pedal_intervals = [(max(0, d - leading_offset), max(0, u - leading_offset))
                                 for d, u in pedal_intervals]
@@ -1595,26 +1741,38 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
                       file=sys.stderr)
     bar_ticks = bar_ticks_for(time_sig)
 
+    tempo_curve = rebase_tempo_curve(read_tempo_curve(mid, tick_scale), leading_offset)
+
     if tempo is None:
-        detected, tempo_is_generic = detect_source_tempo(mid)
-        if detected is not None and not tempo_is_generic:
-            tempo = detected
-            print(f"No --tempo given -- using source file tempo: {tempo} BPM", file=sys.stderr)
+        if len(tempo_curve) > 1:
+            bpms = [round(mido.tempo2bpm(t), 1) for _, t in tempo_curve]
+            tempo = bpms[0]
+            print(f"No --tempo given -- source file has {len(tempo_curve)} tempo changes "
+                  f"({min(bpms):.1f}-{max(bpms):.1f} BPM) -- preserving the full tempo curve "
+                  f"in the output instead of flattening to one value", file=sys.stderr)
         else:
-            if detected is not None and tempo_is_generic:
-                print(f"No --tempo given -- source file tempo ({detected} BPM) is byte-identical to the "
-                      f"untouched MIDI spec default, which most transcription tools stamp automatically "
-                      f"without actually measuring it. Falling through to rhythm-based estimation instead.",
-                      file=sys.stderr)
-            ranked = estimate_tempo_candidates(mid, notes)
-            estimated = ranked[0][0] if ranked else None
-            tempo = estimated if estimated is not None else 120.0
-            print(f"No --tempo given and no usable tempo in source file -- "
-                  f"{'estimated from note-onset rhythm' if estimated is not None else 'using neutral default'}: "
-                  f"{tempo} BPM", file=sys.stderr)
-            ambiguity = describe_tempo_ambiguity(ranked) if ranked else None
-            if ambiguity:
-                print(ambiguity, file=sys.stderr)
+            tempo_curve = []  # a single event (or none) gains nothing over the flat path below
+            detected, tempo_is_generic = detect_source_tempo(mid)
+            if detected is not None and not tempo_is_generic:
+                tempo = detected
+                print(f"No --tempo given -- using source file tempo: {tempo} BPM", file=sys.stderr)
+            else:
+                if detected is not None and tempo_is_generic:
+                    print(f"No --tempo given -- source file tempo ({detected} BPM) is byte-identical to the "
+                          f"untouched MIDI spec default, which most transcription tools stamp automatically "
+                          f"without actually measuring it. Falling through to rhythm-based estimation instead.",
+                          file=sys.stderr)
+                ranked = estimate_tempo_candidates(mid, notes)
+                estimated = ranked[0][0] if ranked else None
+                tempo = estimated if estimated is not None else 120.0
+                print(f"No --tempo given and no usable tempo in source file -- "
+                      f"{'estimated from note-onset rhythm' if estimated is not None else 'using neutral default'}: "
+                      f"{tempo} BPM", file=sys.stderr)
+                ambiguity = describe_tempo_ambiguity(ranked) if ranked else None
+                if ambiguity:
+                    print(ambiguity, file=sys.stderr)
+    else:
+        tempo_curve = []  # explicit --tempo always wins: flat single tempo, no curve
 
     if split_pitch is None:
         split_pitch = estimate_split_pitch(notes)
@@ -1636,6 +1794,13 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
                   f"{tempo} BPM, so playback is genuinely {tempo / source_encoding_tempo:.2f}x the "
                   f"source's speed (not rescaled to preserve the original real-world duration).",
                   file=sys.stderr)
+
+    tuplet_groups = detect_tuplet_groups(notes) if tuplet_detection == 'auto' else 0
+    if tuplet_groups:
+        print(f"tuplet-detection=auto -- found {tuplet_groups} local tuplet group(s) "
+              f"(quintuplet/septuplet/nontuplet/etc.); those onsets are evenly divided "
+              f"directly instead of snapped independently to the --grid {grid_mode} grid",
+              file=sys.stderr)
 
     resolve_note_durations(notes, temperature, bar_ticks)
     classify_voice_roles(notes)
@@ -1675,17 +1840,6 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
 
     tie_budget = tie_budget_for(temperature)
     weights = optimizer_weights(temperature, tie_weight, rest_weight, artic_weight)
-    optimize_staff_durations(treble, temperature, bar_ticks, weights,
-                              melody_preservation=melody_preservation)
-    optimize_staff_durations(bass, temperature, bar_ticks, weights,
-                              melody_preservation=melody_preservation)
-    fix_same_pitch_overlaps(treble, tie_budget, bar_ticks)
-    fix_same_pitch_overlaps(bass, tie_budget, bar_ticks)
-    # fixing a same-pitch overlap can shorten just one member of a chord
-    # the optimizer already made uniform -- re-harmonize once more to
-    # close that gap. Since this second pass can only ever shorten notes
-    # further (never lengthen), it can't reopen any overlap the previous
-    # step just fixed, so one extra pass is sufficient.
     treble_opt_stats, bass_opt_stats = {}, {}
     optimize_staff_durations(treble, temperature, bar_ticks, weights, treble_opt_stats,
                               melody_preservation=melody_preservation)
@@ -1724,7 +1878,13 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
     tempo_track = MidiTrack()
     tempo_track.append(MetaMessage('time_signature', numerator=time_sig[0], denominator=time_sig[1],
                                     clocks_per_click=24, notated_32nd_notes_per_beat=8, time=0))
-    tempo_track.append(MetaMessage('set_tempo', tempo=mido.bpm2tempo(tempo), time=0))
+    if len(tempo_curve) > 1:
+        last_tick = 0
+        for tick, raw_tempo in tempo_curve:
+            tempo_track.append(MetaMessage('set_tempo', tempo=raw_tempo, time=max(0, tick - last_tick)))
+            last_tick = tick
+    else:
+        tempo_track.append(MetaMessage('set_tempo', tempo=mido.bpm2tempo(tempo), time=0))
     tempo_track.append(MetaMessage('end_of_track', time=0))
 
     out = MidiFile(type=1, ticks_per_beat=TICKS_PER_BEAT)
@@ -1814,6 +1974,7 @@ def interactive_mode():
 
     # load the file now so we can suggest data-driven defaults
     mid = MidiFile(input_path)
+    tick_scale = TICKS_PER_BEAT / mid.ticks_per_beat if mid.ticks_per_beat != TICKS_PER_BEAT else 1.0
 
     track_summary = summarize_tracks(mid)
     auto_track_idx = find_note_track(mid)
@@ -1871,6 +2032,10 @@ def interactive_mode():
     for t in track_indices:
         notes.extend(extract_notes(mid.tracks[t], channel=channel_override))
     notes.sort(key=lambda n: (n['start'], n['pitch']))
+    if tick_scale != 1.0:
+        for n in notes:
+            n['start'] = round(n['start'] * tick_scale)
+            n['end'] = round(n['end'] * tick_scale)
     if not notes:
         print(f"Error: no notes found on track(s) {track_indices}"
               f"{f' channel {channel_override}' if channel_override is not None else ''}.")
@@ -2297,6 +2462,15 @@ def main():
     ap.add_argument('--hand-ambiguity-zone', type=int, default=3, metavar='SEMITONES',
                      help='How close (in semitones) to the split point a note has to be before '
                           '--hand-assignment will reconsider it. Default: 3.')
+    ap.add_argument('--tuplet-detection', choices=['auto', 'off'], default='off',
+                     help='[experimental, default off -- not yet validated against real pieces, '
+                          'same status as --melody-preservation/--dynamic-split/--hand-assignment] '
+                          '"auto": detect local n-tuplet bursts (quintuplets, septuplets, nontuplets, '
+                          'etc. against a 1- or 2-beat span) directly in the source, independent of '
+                          '--grid, and quantize just those onsets to exact even division instead of '
+                          'snapping each one independently to the outer grid -- fixes uneven durations '
+                          'on genuinely fast ornamental material. "off" (default): use only the '
+                          '--grid straight/triplet grid everywhere.')
     if pre_args.profile:
         ap.set_defaults(**PROFILES[pre_args.profile])
     args = ap.parse_args()
@@ -2333,7 +2507,8 @@ def main():
         args.tie_weight, args.rest_weight, args.articulation_weight,
         args.tempo_rescale == 'preserve-duration', args.melody_preservation == 'on',
         args.dynamic_split == 'on', args.split_window_bars,
-        args.hand_assignment == 'on', args.max_hand_span, args.hand_ambiguity_zone)
+        args.hand_assignment == 'on', args.max_hand_span, args.hand_ambiguity_zone,
+        args.tuplet_detection)
 
 
 if __name__ == '__main__':

@@ -158,6 +158,14 @@ trusting these:
   near the split point and moves a note to the other hand if it's
   actually closer to that hand's recent position and doing so doesn't
   exceed `--max-hand-span`
+- **`--tuplet-detection auto`** — finds local n-tuplet bursts
+  (quintuplets, septuplets, nontuplets, etc. against a 1- or 2-beat
+  span), independent of `--grid`, and snaps just those onsets to exact
+  even division instead of letting each one round independently to the
+  outer grid. Not built on `classify_voice_roles` like the other three
+  here -- its own detection pass, see `docs/tuplet-detection-design.md`
+  for the algorithm and known limitations (partial-group matches,
+  fit-tolerance calibrated on only 3 pieces so far)
 - The diagnostic report also gains three sections regardless of which
   experimental flags are on: **"Measures Needing Attention"** (bars with
   the most chord conflicts/rests/heavy ties, worth a manual look),
@@ -337,13 +345,49 @@ ScorePrep.py offers. Run `reduce_test.py --help` for the full flag list.
 
 Not promising a big list — just what's actively being considered next:
 
+- ~~Irregular tuplet support~~ -- **implemented as `--tuplet-detection
+  auto|off`** (default `off`, same unvalidated-experimental status as the
+  other three flags below), see Changelog and
+  `docs/tuplet-detection-design.md`. Doubles as per-passage auto-detection
+  as originally scoped. Remaining open items, in priority order:
+  - Validate via `benchmark_experimental.py`'s new `tuplet` feature on
+    real pieces (same bar the other three experimental features are
+    already held to) before ever considering `auto` as the default.
+  - Greedy left-to-right matching can settle for a partial group (e.g.
+    catching 5 of a real 9-onset run, then falling back to normal
+    quantization for the rest) instead of holding out for a better
+    whole-group fit -- known v1 limitation, not yet addressed.
+  - Fixed 24-tick fit-tolerance was calibrated against only 3 pieces (one
+    confirmed tuplet-dense via its own notated score, two with no
+    independent evidence either way); worth revisiting as more real
+    pieces go through the benchmark.
+- ~~Full tempo-track passthrough~~ -- done, see Changelog. While
+  investigating this on the same real piece above, also found and fixed
+  a bigger, previously-unknown bug: non-384-PPQ sources were never
+  actually rescaled into the internal grid space, silently distorting
+  quantization on any such file (~25% for a 480-PPQ source, compounding
+  over the piece) -- see Changelog for details
+- Grace-note detection/notation -- currently no dedicated classifier;
+  short grace notes either get caught by `--min-note-ticks` filtering or
+  survive as oddly-short competing notes rather than real grace-note
+  glyphs. Moderate effort (duration alone can't distinguish a grace note
+  from a legitimately fast written note) and moderate frequency across
+  expressive piano arrangements generally
+- Mid-passage clef borrowing (a fast run temporarily notated in the
+  other staff's clef to avoid ledger lines) -- lowest priority: rarest of
+  the four, and would need a genuinely different per-note clef data model
+  rather than the current treble/bass split, which is a bigger
+  architectural cost than anything else on this list for a cosmetic
+  engraving nicety. `--hand-assignment` already gives a reasonable
+  pitch-based approximation; only worth picking up if real benchmarked
+  pieces turn out to need it often enough to justify the cost
 - Chord-conflict resolution direction (prefer shortest vs. longest)
 - Same-pitch overlap priority (truncate earlier vs. delay later note)
 - Instrument/channel assignment on output (`program_change`)
 - Custom track naming
 - Validating the experimental voice-role-based features (`--melody-preservation`,
-  `--dynamic-split`, `--hand-assignment`) against real pieces before considering
-  any of them stable or on by default
+  `--dynamic-split`, `--hand-assignment`, `--tuplet-detection`) against real pieces
+  before considering any of them stable or on by default
 - Exact repeat detection (post-quantization measure hashing, velocity excluded) + 1st/2nd-ending suggestion as a direct extension — optional, user-confirmed, not auto-applied; explicitly excludes fuzzy/ornamented/transposed repeat matching
 
 ## Changelog
