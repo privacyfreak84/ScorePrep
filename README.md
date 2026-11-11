@@ -199,8 +199,8 @@ trusting these:
 
 - **`--profile {readable,balanced,faithful}`** — sets `--tie-temperature`,
   `--pedal-mode`, `--grid`, and `--clean-durations` together instead of
-  tuning them individually. `balanced` is the benchmark-tested sweet
-  spot (see the benchmark suite for methodology)
+  tuning them individually. `balanced` is the middle setting and a
+  good starting point
 - **`--melody-preservation on`** — biases the duration optimizer per
   note by voice role: melody gets cheaper ties/costlier rests
   (protect continuity), accompaniment gets the opposite (declutter
@@ -486,13 +486,11 @@ Not promising a big list — just what's actively being considered next:
   other three flags below), see Changelog and the
   `detect_tuplet_groups` docstring. Doubles as per-passage auto-detection
   as originally scoped. Remaining open items, in priority order:
-  - Validate via `benchmark_experimental.py`'s new `tuplet` feature on
-    real pieces (same bar the other three experimental features are
-    already held to) before ever considering `auto` as the default.
+  - Validate on real pieces (same bar the other three experimental
+    features are held to) before ever considering `auto` as the default.
   - Fixed 24-tick fit-tolerance (n-tuplets) and 1x-GRID duration cutoff
     (sub-grid clusters) were both calibrated against only a handful of
-    real pieces; worth revisiting as more real pieces go through the
-    benchmark.
+    real pieces; worth revisiting as more real pieces go through it.
   - One known residual case, not yet addressed: a normal-duration note
     landing right after a sub-grid cluster can still coincidentally
     collide with that cluster's now-fixed anchor tick. Loosening the
@@ -527,7 +525,7 @@ Not promising a big list — just what's actively being considered next:
   rather than the current treble/bass split, which is a bigger
   architectural cost than anything else on this list for a cosmetic
   engraving nicety. `--hand-assignment` already gives a reasonable
-  pitch-based approximation; only worth picking up if real benchmarked
+  pitch-based approximation; only worth picking up if real
   pieces turn out to need it often enough to justify the cost
 - Chord-conflict resolution direction (prefer shortest vs. longest)
 - Same-pitch overlap priority (truncate earlier vs. delay later note)
