@@ -66,12 +66,56 @@ have a trustworthy one) is the expected common case.
 - Tempo estimation: source file's own tempo → rhythm-pattern estimate →
   120 BPM fallback, with transparent reasoning printed at every step
 - Tempo-curve passthrough: a source with real tempo changes keeps them in
-  the output. A curve that looks like transcription jitter (big tempo
-  jumps packed within a bar of each other) is replaced by one
-  representative tempo instead; `--trust-tempo-curve` keeps it anyway
+  the output.
+- **Beat tracking** — when the source's tempo map looks erratic (big
+  tempo jumps packed within a bar of each other), its beat positions
+  can't be trusted either. ScorePrep then goes back to when each note was
+  actually played and finds the beats itself, following the player's
+  speeding up and slowing down, and writes a beat-by-beat tempo curve so
+  playback keeps the original pacing. On the one piece with a published
+  score to check against (a rubato performance of River Flows in You),
+  96% of the score's on-beat notes land on a beat and 98% of its
+  downbeats on a barline; the source's own map managed 91% and 54%.
+  `--beat-tracking on` forces it for any file (experimental: on files
+  with no tempo map it may read the piece at half or double tempo),
+  `off` restores the old flatten-to-one-tempo behavior, and
+  `--trust-tempo-curve` keeps the source's map as it is. The source's
+  time signature is set aside along with its map (4/4 is assumed; pass
+  `--time-sig` otherwise), and a pickup is written at the end of an
+  opening bar of rests
 - Time signature: read from the source, or `--time-sig`
 - Interactive step-by-step mode — just run `ScorePrep.py` with no
   arguments
+
+### MusicXML export
+- **`--format musicxml`** (or just give the output file a `.musicxml`
+  name) writes a MusicXML score instead of MIDI; `--format both` writes
+  the two side by side. A MIDI file can only hand MuseScore the notes,
+  and its importer then works out staves, ties, rests and note names
+  again by itself. The MusicXML file carries ScorePrep's own decisions
+  straight through: which hand plays each note, every written length and
+  tie exactly as the duration optimizer chose it, tuplet brackets, and
+  ornament signs.
+- **Key signature and note spelling** — the key is estimated from the
+  notes (or set with `--key`), and every note is spelled for that key
+  (C♯ or D♭). A note outside the key is spelled by where it goes next:
+  up a half step reads as a sharp, down as a flat. Checked against 50
+  engraved scores (28,274 notes): the estimated key signature matched
+  the printed one in 47, and 98.9% of notes were spelled as printed.
+- **Voices** — notes in one hand that overlap need separate voices on
+  paper. A note that only just overlaps the next one (fingers or pedal
+  holding over) is written ending where the next note starts, whatever
+  the voice limit; against the published River Flows in You score this
+  moved written lengths from 74% to 82% agreement. `--max-voices`
+  (default 2) then caps how many voices each staff may use, cutting notes
+  that overlap more deeply. The report counts the two separately. On a
+  heavily pedaled piece (kalank) the cap cuts 159 notes at 2 voices, 29
+  at 3 and 4 at 4, for about 7% more rests on the page at 3 -- worth
+  raising there. The MIDI output always keeps every note's full length.
+- What it doesn't carry yet: beams are left to the notation software,
+  the playback-only sustain pedal stays in the MIDI file, the key
+  signature is one for the whole piece, and `--grid triplet` isn't
+  supported (use `--tuplet-detection auto` for tuplets).
 
 ### Musical cleanup
 - **Sustain-pedal handling** (`--pedal-mode reflect`) — extends a
@@ -89,6 +133,12 @@ have a trustworthy one) is the expected common case.
   `--velocity-mode scale`/`normalize` reshapes dynamics
 - Transcription-noise filtering (`--min-note-ticks`) for sub-audible
   blips
+- **Fast notes kept apart** — two notes too quick for the 16th-note
+  grid are written as 32nds instead of merging into a chord (or, on a
+  repeated pitch, losing a note). `--fast-notes off` turns this off
+- A note held much longer than a short note struck with it (four times
+  longer, and at least a beat) keeps its own length instead of being cut
+  to match
 
 ### Robustness
 - **Cost-based duration optimizer** — the biggest change in this
@@ -172,6 +222,14 @@ trusting these:
   (fit tolerance calibrated on only 3 pieces so far).
   `--tuplet-fit-tolerance relative|absolute` sets how strictly a
   candidate group must fit even spacing
+- **`--ornament-detection auto`** — recognizes mordents, turns and
+  trills (very quick stepwise figures around one note, each note faster
+  than a 32nd) and writes each as a single note with its ornament sign in
+  MusicXML output, adding a small accidental when the neighbor note
+  isn't the one the key gives. MIDI output is unchanged — it has no way
+  to hold an ornament sign. The speed threshold comes from one piece
+  where real ornaments and ordinary 16th-note runs of the same shape
+  were clearly apart; treat it as a first calibration
 - The diagnostic report also gains three sections regardless of which
   experimental flags are on: **"Measures Needing Attention"** (bars with
   the most chord conflicts/rests/heavy ties, worth a manual look),
@@ -195,6 +253,12 @@ python3 ScorePrep.py transcription.mid clean.mid --grid triplet
 
 # Multi-track source, piano is track 2
 python3 ScorePrep.py transcription.mid clean.mid --track 2
+
+# MusicXML score instead of MIDI (or --format both for the pair)
+python3 ScorePrep.py transcription.mid clean.musicxml
+
+# MusicXML with tuplet brackets and ornament signs, in a key you choose
+python3 ScorePrep.py transcription.mid clean.musicxml --tuplet-detection auto --ornament-detection auto --key F#m
 
 # Interactive, step-by-step
 python3 ScorePrep.py
@@ -243,7 +307,13 @@ python3 ScorePrep.py --help
 | `--hand-ambiguity-zone N` | How close (semitones) to the split point a note must be before `--hand-assignment` reconsiders it. Default: `3` |
 | `--tuplet-detection {auto,off}` | [experimental] Detect local n-tuplet bursts and 2-3 note clusters too tight for the grid, and space those onsets evenly. Default: `off` |
 | `--tuplet-fit-tolerance {relative,absolute}` | With `--tuplet-detection auto`: `relative` (default) requires a fit within 15% of the group's own subdivision width; `absolute` uses the older flat 24-tick threshold |
-| `--trust-tempo-curve` | Keep the source's multi-event tempo curve even when it looks like transcription jitter |
+| `--trust-tempo-curve` | Keep the source's multi-event tempo curve and beat positions even when the curve looks erratic |
+| `--fast-notes {auto,off}` | `auto` (default): notes too quick for the 16th grid, which would merge onto one tick, are written as 32nds. `off`: leave them on the 16th grid |
+| `--beat-tracking {auto,on,off}` | Find the beats from the real note timing. `auto` (default): when the source's tempo map looks erratic. `on`: always (experimental). `off`: never. Ignored when `--tempo` is given |
+| `--format {midi,musicxml,both}` | What to write. Default: decided by the output file's extension (`.musicxml` / `.xml` → MusicXML, anything else → MIDI) |
+| `--key KEY` | MusicXML only. Key to write in: `A`, `F#m`, `"Bb minor"`, or a number of sharps (+) / flats (−) like `-3`. Default: estimated from the notes |
+| `--max-voices N` | MusicXML only. Most voices per staff, 1–4. Default: `2` |
+| `--ornament-detection {auto,off}` | [experimental] Write mordents, turns and trills as ornament signs in MusicXML output. Default: `off` |
 | `--interactive` | Force step-by-step prompts |
 
 Run `ScorePrep.py --help` for full, current wording on every flag.
@@ -360,22 +430,16 @@ ScorePrep.py offers. Run `reduce_test.py --help` for the full flag list.
 
 Not promising a big list — just what's actively being considered next:
 
-- MusicXML export, as an alternative/additional output to MIDI --
-  potentially the highest-value item on this list. Right now ScorePrep
-  hands MuseScore a MIDI file, and MuseScore's own MIDI-import step
-  re-derives staff assignment, tie/rest structure, and note spelling
-  from scratch -- redoing (and sometimes second-guessing) decisions
-  ScorePrep already made carefully (duration optimizer, hand
-  assignment, tuplet tagging). A direct MusicXML export would carry
-  those decisions through exactly as computed instead of re-deriving
-  them through a lossy MIDI round-trip, and gives a real place to put
-  things MIDI has no room for at all -- key signatures, explicit tuplet
-  brackets, and eventually real ornament symbols (see ornament
-  detection above). Main technical cost: pitch spelling -- a MIDI note
-  number alone doesn't say whether it's a C# or a Db, which MusicXML
-  requires; would need real enharmonic spelling logic (key-aware,
-  probably informed by voice-leading) that doesn't currently exist
-  anywhere in the pipeline
+- ~~MusicXML export~~ -- **implemented as `--format musicxml|both`**,
+  with key estimation and pitch spelling (see "MusicXML export" above
+  and the Changelog). Remaining open items:
+  - `--grid triplet` in MusicXML: needs triplet brackets worked out beat
+    by beat; refused with a clear message for now.
+  - Key changes inside a piece: one key signature is written for the
+    whole score.
+  - Beams and the playback sustain pedal aren't written.
+  - Spelling was validated on classical scores; the three test pieces
+    here have no printed score to check against.
 - Rebrand ScorePrep beyond "AI MIDI cleaner" into something bigger --
   not yet scoped (what the bigger identity actually is, what stays vs.
   changes in the pitch/positioning, whether the name itself changes).
@@ -409,14 +473,14 @@ Not promising a big list — just what's actively being considered next:
   voice importance scoring, register collision detection, glide/vibrato
   collapse, interactive mode). Needs a fresh look at what it's missing
   relative to where the main tool has moved since.
-- Ornament detection -- broader than the grace-note gap below: actual
-  recognition of recurring melodic ornament shapes (turns, mordents,
-  trills) as *named* ornaments, not just correctly-timed literal notes.
-  `--tuplet-detection auto`'s new sub-grid cluster pass (see Changelog)
-  already fixes the *timing* of these figures directly in the source
-  data during investigation, but still emits them as literal fast
-  notes -- this would be the next layer up: recognizing the shape
-  itself and notating it as a real ornament symbol instead.
+- ~~Ornament detection~~ -- **implemented as `--ornament-detection
+  auto|off`** (default `off`, experimental): mordents, turns and trills
+  become ornament signs in MusicXML output. Remaining open items:
+  - Calibrated on one real piece (14 mordents found, all the same
+    shape); turns and trills are only tested on constructed examples.
+    Needs more real pieces before `auto` could be the default.
+  - Slower ornaments (notes of 16th length or more at the notated
+    tempo) are deliberately left as written-out notes.
 - ~~Irregular tuplet support~~ -- **implemented as `--tuplet-detection
   auto|off`** (default `off`, same unvalidated-experimental status as the
   other three flags below), see Changelog and the
@@ -446,7 +510,9 @@ Not promising a big list — just what's actively being considered next:
   auto-detected and discarded in favor of one estimated representative
   tempo, with `--trust-tempo-curve` as an explicit override -- see
   Changelog.
-- Grace-note detection/notation -- currently no dedicated classifier;
+- Grace-note detection/notation -- now much cheaper to add, since
+  MusicXML has a real grace-note element and the ornament pass already
+  finds quick lead-in notes. Currently no dedicated classifier;
   short grace notes either get caught by `--min-note-ticks` filtering or
   survive as oddly-short competing notes rather than real grace-note
   glyphs. Moderate effort (duration alone can't distinguish a grace note

@@ -67,8 +67,12 @@ USAGE
 import argparse
 import json
 import os
+import re
 import sys
 from collections import defaultdict
+from fractions import Fraction
+from math import gcd
+from xml.sax.saxutils import escape as xml_escape
 
 import mido
 from mido import MidiFile, MidiTrack, Message, MetaMessage
@@ -129,25 +133,10 @@ def save_last_paths(input_path, output_path):
     except OSError:
         pass
 
-TICKS_PER_BEAT = 384          # matches this script's assumed source resolution
+TICKS_PER_BEAT = 384          # internal grid resolution; sources at any other PPQ are rescaled to it in run()
 SPLIT_PITCH = 60              # middle C
 DEFAULT_TIME_SIG = (4, 4)     # fallback when no time signature is given/detected
 
-# Quantization grid unit, and the set of single-notehead-representable
-# durations (no ties needed) expressed as a count of that unit.
-#
-# 'straight' uses a 16th note as the unit (TICKS_PER_BEAT/4 = 96 ticks) --
-# only ever hits straight subdivisions, so a genuinely triplet/swung
-# passage gets forced onto the nearest straight 16th, distorting its
-# rhythm.
-#
-# 'triplet' uses TICKS_PER_BEAT/12 = 32 ticks as the unit instead -- the
-# largest unit that evenly divides both a straight 16th (3 units) and a
-# triplet 8th (4 units), so both families of note value are natively
-# representable on the same grid without forcing one onto the other.
-# CLEAN values below are each straight value * 3 (to re-express them in
-# the finer unit) plus the triplet-specific values: a triplet 16th (2
-# units), triplet 8th (4), and triplet quarter (8, i.e. two triplet 8ths).
 # Quantization grid unit, and the set of single-notehead-representable
 # durations (no ties needed) expressed as a count of that unit.
 #
@@ -170,7 +159,7 @@ DEFAULT_TIME_SIG = (4, 4)     # fallback when no time signature is given/detecte
 # plain power-of-two note values only (a plainer, more old-fashioned
 # look, at the cost of needing more ties for anything a dotted value
 # would otherwise have covered in one notehead).
-POWERS_OF_TWO = (1, 2, 4, 8, 16, 32, 64)     # 64th, 32nd, 16th, 8th, quarter, half, whole
+POWERS_OF_TWO = (1, 2, 4, 8, 16, 32, 64)     # 16th, 8th, quarter, half, whole, breve, 4 whole notes
 DOTTED = (3, 6, 12, 24, 48)                  # dotted-8th, -quarter, -half, -whole, -breve
 TRIPLET_ONLY = (2, 4, 8)                     # triplet 16th, triplet 8th, triplet quarter
 
@@ -271,8 +260,17 @@ def extract_notes(track, channel=None):
     get tracked in the active-note map, since a single track can carry
     several channels merged together (common in type-0 files) and only
     one of them may be the intended piano part."""
+    # Pair every note_off with the OLDEST unfinished note_on of its pitch.
+    # Transcriptions of legato repeated notes often overlap them: the new
+    # note_on arrives a few ms before the previous note's note_off. Pairing
+    # that late note_off with the newest note_on instead (as this used to)
+    # gives the new note a length of a few ms -- then dropped as noise --
+    # which is how the first note of a quick figure on a repeated pitch
+    # went missing. A piano key can't sound twice at once, so after
+    # pairing, a note still sounding at its pitch's next onset is ended
+    # there.
     abs_t = 0
-    active = {}
+    open_notes = defaultdict(list)       # pitch -> [index into notes], oldest first
     notes = []
     for msg in track:
         abs_t += msg.time
@@ -280,18 +278,18 @@ def extract_notes(track, channel=None):
         if is_note_msg and channel is not None and msg.channel != channel:
             continue
         if msg.type == 'note_on' and msg.velocity > 0:
-            if msg.note in active:
-                start, vel = active.pop(msg.note)
-                if abs_t > start:
-                    notes.append({'start': start, 'end': abs_t,
-                                  'pitch': msg.note, 'vel': vel})
-            active[msg.note] = (abs_t, msg.velocity)
+            open_notes[msg.note].append(len(notes))
+            notes.append({'start': abs_t, 'end': None, 'pitch': msg.note, 'vel': msg.velocity})
         elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
-            if msg.note in active:
-                start, vel = active.pop(msg.note)
-                notes.append({'start': start, 'end': abs_t,
-                              'pitch': msg.note, 'vel': vel})
-    return notes
+            if open_notes[msg.note]:
+                notes[open_notes[msg.note].pop(0)]['end'] = abs_t
+    last_onset = {}
+    for n in reversed(notes):
+        nxt = last_onset.get(n['pitch'])
+        if nxt is not None and (n['end'] is None or n['end'] > nxt):
+            n['end'] = nxt               # re-struck before it was released (or never released)
+        last_onset[n['pitch']] = n['start']
+    return [n for n in notes if n['end'] is not None and n['end'] > n['start']]
 
 
 def read_pedal_intervals(mid):
@@ -556,11 +554,60 @@ TUPLET_SPANS_BEATS = (1, 2)
 # 5-12x more detected groups than two pieces with no such evidence --
 # the strongest calibration signal available without ground-truth
 # tuplet annotations for every benchmark piece.
-TUPLET_FIT_TOLERANCE_TICKS = 24
+TUPLET_FIT_TOLERANCE_TICKS = 24  # only used when fit_mode='absolute'
+
+# The design doc for this feature originally specified the fit tolerance
+# as a PERCENTAGE of the subdivision width (15% of one ideal sub-division),
+# not a flat tick count -- but what got implemented was the flat
+# TUPLET_FIT_TOLERANCE_TICKS above, applied the same regardless of how
+# tightly-packed the group is. Found via a real case: a 1-beat quintuplet
+# (subdivision width 76.8 ticks) had one member land 26 ticks from its
+# ideal position -- a big miss relative to how tight the group is -- but
+# the group's *average* error (15.4) still cleared the flat 24-tick bar,
+# so the whole group got force-evened anyway, overriding that member's
+# real recorded timing. 15% of 76.8 is only ~11.5 -- correctly stricter
+# for a tightly-packed group like this one. A flat 24 happens to roughly
+# match 15% for a 2-beat quintuplet (subdivision ~154 ticks), which is
+# likely what it was originally calibrated against -- fine there, too
+# lenient for smaller spans/higher N. 'relative' (this constant) is now
+# the default; 'absolute' (the original flat constant above) is kept
+# available for anyone who wants the older, more lenient behavior.
+TUPLET_FIT_TOLERANCE_PCT = 0.15
+
+# How far past the accept threshold a failing tuplet-candidate fit may be
+# and still be treated as a genuine "near miss" for
+# resolve_rejected_tuplet_collisions, rather than an ordinary passage that
+# coincidentally has n_cand onsets in its span with no real tuplet
+# relationship. See that function and TUPLET_FIT_TOLERANCE_PCT's comment
+# for the motivating case.
+NEAR_MISS_TOLERANCE_MULT = 2.0
+
+# Max semitone gap allowed between consecutive members of a candidate
+# sub-grid cluster (see detect_subgrid_clusters below). Real ornamental
+# figures found in practice (mordents/turns: e.g. a whole-step-and-back)
+# stay within a handful of semitones; the one false-positive case found
+# during investigation (a melody note and an unrelated bass note landing
+# on the same coarse tick purely by coincidence) was 33 semitones apart.
+# 12 (one octave) comfortably separates the two without hand-assignment
+# info, which isn't available this early in the pipeline.
+SUBGRID_MAX_PITCH_GAP = 12
+
+# Only notes shorter than one grid unit are eligible for sub-grid
+# clustering at all. Found necessary empirically: without it, ordinary
+# long-held chords with a few ticks of natural strike jitter between
+# their notes (durations in the hundreds/thousands of ticks -- nothing
+# like a real ornament) got caught by the pitch/time chain, because that
+# chain only checks ADJACENT pairs -- a whole chord can sneak through as
+# a "connected" chain even though its full span is wide, if each
+# consecutive step happens to be small enough. Real ornaments found in
+# practice are all well under one grid unit long (22-57 ticks on a
+# 96-tick grid); a long-held note is never part of one regardless of how
+# close its onset lands to a neighbor's.
+SUBGRID_MAX_NOTE_DURATION_FACTOR = 1.0  # x GRID
 
 
-def detect_tuplet_groups(notes):
-    """Find local n-tuplet bursts (5/6/7/9/10/11-against-1-or-2-beats)
+def detect_tuplet_groups(notes, fit_mode='relative'):
+    """Find local n-tuplet bursts (5/7/9/10/11-against-1-or-2-beats)
     directly in the raw, unquantized tick stream -- before any grid
     quantization or treble/bass split, since a real tuplet run can
     straddle both hands and either step could otherwise sever a group
@@ -582,18 +629,35 @@ def detect_tuplet_groups(notes):
     cost-optimal or evidence-capped choice.
 
     Requires an EXACT onset-count match against a candidate window (no
-    partial-fill tolerance) and a strict average-fit-error threshold, so
+    partial-fill tolerance) and a strict fit-error threshold, so
     coincidental fast-but-not-tuplet clustering (grace-note runs,
     trills, glissandi) falls through untouched to normal quantization --
-    a wrong tuplet call reads worse than no tuplet call at all. Greedy,
-    left-to-right, non-overlapping: a later, better-fitting grouping
-    starting inside an already-accepted one is never reconsidered
-    (acceptable v1 heuristic, see design doc).
+    a wrong tuplet call reads worse than no tuplet call at all.
+    fit_mode='relative' (default): threshold scales with the group's own
+    subdivision width (TUPLET_FIT_TOLERANCE_PCT), so a tightly-packed
+    group (small span, high N) is held to a proportionally stricter
+    standard than a loosely-packed one. fit_mode='absolute': the older
+    flat TUPLET_FIT_TOLERANCE_TICKS regardless of subdivision width --
+    kept available for anyone who wants the more lenient original
+    behavior. See TUPLET_FIT_TOLERANCE_PCT's comment for why relative is
+    now the default. Greedy, left-to-right, non-overlapping: a later,
+    better-fitting grouping starting inside an already-accepted one is
+    never reconsidered (acceptable v1 heuristic, see design doc).
 
-    Mutates notes in place. Returns the number of groups found (for the
-    run() log line only)."""
+    Mutates notes in place. Returns (group_count, rejected_windows):
+    group_count is the number of accepted groups (for the run() log line);
+    rejected_windows is a list of onset-tick lists, one per position where
+    an exact-onset-count candidate was found but failed the fit-tolerance
+    check -- consumed by resolve_rejected_tuplet_collisions to catch the
+    real grid-tick collisions a correctly-rejected window can still leave
+    behind. Members of a rejected window are NOT added to `used` and
+    remain eligible for a later, smaller window starting at the same
+    position, or for detect_subgrid_clusters, exactly as before this
+    return value was added -- only rejected_windows' own bookkeeping
+    (near_miss_used) dedupes so the same burst isn't recorded once per
+    onset inside it."""
     if not notes:
-        return 0
+        return 0, []
 
     by_onset = defaultdict(list)
     for n in notes:
@@ -601,11 +665,32 @@ def detect_tuplet_groups(notes):
     starts = sorted(by_onset)
 
     used = set()
+    near_miss_used = set()  # separate from `used`: only dedupes which
+    # near-miss windows get recorded for resolve_rejected_tuplet_collisions
+    # below, so overlapping/nested near-misses spawned by every onset
+    # inside an already-recorded burst aren't each recorded as their own
+    # window (that would process the same notes' collisions repeatedly
+    # and compound). Deliberately NOT merged into `used` itself, so a
+    # smaller valid tuplet nested inside a rejected span can still be
+    # found normally, exactly as before this dedup was added.
     group_count = 0
+    rejected_windows = []
     for i, start in enumerate(starts):
         if start in used:
             continue
         best = None  # (avg_error, n_cand, group_starts)
+        # Also track the best-but-failing exact-onset-count candidate at
+        # this position (same size/error tie-break preference as `best`),
+        # so a caller can later check whether a rejected window still
+        # produces a real grid-tick collision -- see
+        # resolve_rejected_tuplet_collisions.
+        near_miss = None
+        # Prefer whichever passing candidate covers the MOST onsets, not
+        # whichever happens to have the lowest average error -- a tight
+        # partial match (e.g. 5 of a real 9-onset burst) must not win over
+        # a looser-but-still-valid full match, or the leftover onsets are
+        # stranded outside any group and fall back to plain grid-snapping.
+        # Average error only breaks ties between equally-sized matches.
         for span_beats in TUPLET_SPANS_BEATS:
             span = span_beats * TICKS_PER_BEAT
             window_end = start + span
@@ -615,7 +700,26 @@ def detect_tuplet_groups(notes):
                     continue
                 ideal = [start + round(k * span / n_cand) for k in range(n_cand)]
                 avg_error = sum(abs(a - b) for a, b in zip(window_starts, ideal)) / n_cand
-                if avg_error <= TUPLET_FIT_TOLERANCE_TICKS and (best is None or avg_error < best[0]):
+                threshold = (TUPLET_FIT_TOLERANCE_PCT * (span / n_cand) if fit_mode == 'relative'
+                             else TUPLET_FIT_TOLERANCE_TICKS)
+                if avg_error > threshold:
+                    # Only a window that FAILED NARROWLY is a real near-miss
+                    # worth checking for collision-repair -- an ordinary
+                    # passage that coincidentally has n_cand onsets in the
+                    # span (common: extra passing/ornament notes bump an
+                    # otherwise-straight run's count up to 9 or 10) can miss
+                    # by hundreds of ticks and has no tuplet relationship to
+                    # repair. NEAR_MISS_TOLERANCE_MULT bounds how far past
+                    # the accept threshold a failing fit can be and still
+                    # count -- calibrated from the one real case motivating
+                    # this (RiverFlowInYou tick ~6114: avg error 22 against
+                    # a ~11.5 threshold, ~1.9x) with headroom to 2x.
+                    if (avg_error <= NEAR_MISS_TOLERANCE_MULT * threshold
+                            and (near_miss is None or n_cand > near_miss[1]
+                                 or (n_cand == near_miss[1] and avg_error < near_miss[0]))):
+                        near_miss = (avg_error, n_cand, span, window_starts)
+                    continue
+                if best is None or n_cand > best[1] or (n_cand == best[1] and avg_error < best[0]):
                     best = (avg_error, n_cand, span, window_starts)
         if best is not None:
             _, n_cand, span, group_starts = best
@@ -626,9 +730,336 @@ def detect_tuplet_groups(notes):
                     n['_tuplet'] = True
                     n['_tuplet_start'] = ideal_ticks[k]
                     n['_tuplet_end'] = ideal_ticks[k + 1]
+                    # (group start, span, N, slot index) -- not used for MIDI
+                    # output; lets the MusicXML writer draw the bracket
+                    n['_tuplet_group'] = (group_start, span, n_cand, k)
                 used.add(s)
             group_count += 1
-    return group_count
+        elif near_miss is not None:
+            nm_starts = near_miss[3]
+            if not any(s in near_miss_used for s in nm_starts):
+                rejected_windows.append(nm_starts)
+                near_miss_used.update(nm_starts)
+    return group_count, rejected_windows
+
+
+def detect_subgrid_clusters(notes):
+    """Catch small (2-3 note) clusters that would collide onto the same
+    coarse grid tick because their raw spacing is tighter than one grid
+    unit -- e.g. a quick melodic turn/mordent squeezed into less time
+    than a single 16th note. Run this AFTER detect_tuplet_groups (skips
+    anything already tuplet-tagged) and before generic quantization.
+
+    Deliberately narrower than detect_tuplet_groups in one specific way:
+    N=2/3 are exactly what that function excludes, because at full-beat
+    scale almost any ordinary rhythm trivially has 2-3 onsets in a beat
+    window, and evenly dividing those would destroy real, intentional
+    non-uniform rhythms (a dotted-8th-plus-16th, say). That risk doesn't
+    apply here because the trigger condition is completely different:
+    this only fires when the outer grid would ACTUALLY collide two
+    onsets onto one tick, which normal-speed material never does
+    regardless of N -- it's the collision itself that's the safe,
+    narrow signal, not the onset count.
+
+    Still needs one more guard the beat-scale search doesn't: at this
+    point in the pipeline hands haven't been split or assigned yet, so
+    without it, a melody note and an unrelated bass note that happen to
+    land on the same coarse tick purely by coincidence would be treated
+    as one figure and have their real timing perturbed to satisfy each
+    other. Gated with SUBGRID_MAX_PITCH_GAP -- real ornaments discovered
+    in practice move within a handful of semitones; the one coincidental
+    cross-hand case found during investigation was 33 semitones apart.
+
+    A qualifying cluster's onsets are spread evenly across the ONE outer
+    grid slot they'd otherwise collide into -- same tagging as a tuplet
+    (_tuplet/_tuplet_start/_tuplet_end), so every downstream step that
+    already trusts a tuplet-tagged onset (duration search, hand
+    assignment, tie logic) needs no separate handling for this case.
+
+    Also requires every candidate note to be shorter than one grid unit
+    (SUBGRID_MAX_NOTE_DURATION_FACTOR) -- see that constant's comment.
+    A long-held note sharing a nearby tick with a short one (e.g. an
+    ordinary chord with a few ticks of natural strike jitter between its
+    notes) is simply left out of consideration; only the short note(s),
+    if any, are eligible.
+
+    Mutates notes in place. Returns the number of clusters found."""
+    if not notes:
+        return 0
+
+    max_dur = GRID * SUBGRID_MAX_NOTE_DURATION_FACTOR
+    by_onset = defaultdict(list)
+    for n in notes:
+        if not n.get('_tuplet') and (n['end'] - n['start']) < max_dur:
+            by_onset[n['start']].append(n)
+    starts = sorted(by_onset)
+
+    count = 0
+    i = 0
+    while i < len(starts):
+        cluster = [starts[i]]
+        j = i + 1
+        while j < len(starts) and len(cluster) < 3:
+            if starts[j] - cluster[-1] >= GRID:
+                break
+            prev_pitches = [n['pitch'] for n in by_onset[cluster[-1]]]
+            cand_pitches = [n['pitch'] for n in by_onset[starts[j]]]
+            if min(abs(a - b) for a in prev_pitches for b in cand_pitches) > SUBGRID_MAX_PITCH_GAP:
+                break
+            cluster.append(starts[j])
+            j += 1
+
+        # The longest time/pitch-chained candidate doesn't always actually
+        # collide as a whole (e.g. its first 2 members round to the same
+        # grid tick but its 3rd rounds to the next one) -- try shrinking
+        # before giving up, so that real 2-member collision isn't missed
+        # just because it happened to chain onto a 3rd non-colliding note.
+        matched = False
+        for size in range(len(cluster), 1, -1):
+            sub = cluster[:size]
+            anchor = round(sub[0] / GRID) * GRID
+            if all(round(t / GRID) * GRID == anchor for t in sub):
+                n_cand = size
+                ideal = [anchor + round(k * GRID / n_cand) for k in range(n_cand + 1)]
+                for k, t in enumerate(sub):
+                    for n in by_onset[t]:
+                        n['_tuplet'] = True
+                        n['_tuplet_start'] = ideal[k]
+                        n['_tuplet_end'] = ideal[k + 1]
+                        n['_tuplet_group'] = (anchor, GRID, n_cand, k)
+                count += 1
+                i += size
+                matched = True
+                break
+        if not matched:
+            i += 1
+    return count
+
+
+def place_half_grid_notes(notes):
+    """Stop fast notes from merging. The grid is 16ths, so a 32nd-note
+    figure -- a quick note and the one after it half a 16th later --
+    rounds onto ONE tick: two different pitches come out as a chord, and a
+    repeated pitch loses a note outright. Here every pair of onsets that
+    would collide like that is looked at on a grid twice as fine, and the
+    note that belongs on the half-way point is written there as a 32nd,
+    along with the short note (if any) filling the first half of the same
+    16th.
+
+    Three guards, the same ones detect_subgrid_clusters needed, for the
+    same reason (ordinary chords whose notes are struck a few ticks apart
+    must stay chords): the two onsets are at least a 64th apart, within an
+    octave of each other, and either one of the two notes is shorter than
+    a 16th or the two are a step apart (nobody rolls a chord of seconds;
+    a held-over note a step from the next one is melody). Notes already placed by tuplet or sub-grid detection are
+    left alone.
+
+    Tags moved notes like a sub-grid pair ('_tuplet', start/end, group), so
+    every later step treats them the same way. Mutates notes in place;
+    returns how many notes were placed on a half-way point."""
+    half = GRID // 2
+    if GRID % 2 or not notes:
+        return 0
+    by_onset = defaultdict(list)
+    for n in notes:
+        if not n.get('_tuplet'):
+            by_onset[n['start']].append(n)
+    starts = sorted(by_onset)
+
+    def short(t):
+        return any(n['end'] - n['start'] < GRID for n in by_onset[t])
+
+    def near(a, b):
+        return min(abs(x['pitch'] - y['pitch']) for x in by_onset[a] for y in by_onset[b]) <= SUBGRID_MAX_PITCH_GAP
+
+    def stepwise(a, b):              # a half or whole step apart: a melodic move, never a rolled chord
+        return min(abs(x['pitch'] - y['pitch']) for x in by_onset[a] for y in by_onset[b]) <= 2
+
+    def fast_pair(a, b, min_gap):
+        return b - a >= min_gap and near(a, b) and (short(a) or short(b) or stepwise(a, b))
+
+    # Three onsets inside one 16th can't be told apart even on the finer
+    # grid: write them as a triplet of 32nds across that 16th.
+    moved = 0
+    if GRID % 3 == 0:
+        i = 0
+        while i + 2 < len(starts):
+            a, b, c = starts[i:i + 3]
+            T = quantize(a)
+            # all three inside the 16th that starts at T (the last may sit past
+            # its middle and round forward), and the next onset beyond it
+            nxt = starts[i + 3] if i + 3 < len(starts) else None
+            if (a >= T - GRID // 4 and quantize(b) == T and c < T + GRID - GRID // 6
+                    and (nxt is None or nxt >= T + GRID - GRID // 6)
+                    # all three really are quick notes -- a long third note is
+                    # where the figure LANDS (a touch early), not part of it
+                    and all(n['end'] - n['start'] < GRID for t in (a, b, c) for n in by_onset[t])
+                    and fast_pair(a, b, GRID // 6) and fast_pair(b, c, GRID // 6)):
+                for k, t in enumerate((a, b, c)):
+                    for n in by_onset[t]:
+                        n['_tuplet'] = True
+                        n['_tuplet_start'], n['_tuplet_end'] = T + k * GRID // 3, T + (k + 1) * GRID // 3
+                        n['_tuplet_group'] = (T, GRID, 3, k)
+                        moved += 1
+                i += 3
+            else:
+                i += 1
+        starts = [t for t in starts if not any(n.get('_tuplet') for n in by_onset[t])]
+
+    placed = {}                      # onset tick -> half-grid tick it is moved to
+    for a, b in zip(starts, starts[1:]):
+        if quantize(a) != quantize(b) or b - a < GRID // 4 or not near(a, b):
+            continue
+        if not (short(a) or short(b) or stepwise(a, b)):
+            continue
+        if a in placed:
+            continue                 # three onsets in one slot: the first pair already took it
+        T = quantize(a)
+        ha, hb = round(a / half) * half, round(b / half) * half
+        if ha < hb:
+            # the finer grid tells them apart by itself: each goes where it rounds to
+            if ha != T:
+                placed[a] = ha
+            if hb != T:
+                placed[b] = hb
+        elif (a + b) / 2 >= T + half / 2 or not short(a):
+            placed[b] = T + half     # both round to one point: split around the slot's middle...
+        else:
+            placed[a] = T - half     # ...or around its start, whichever the pair sits nearer
+    for t, h in placed.items():
+        slot = (h // GRID) * GRID
+        for n in by_onset[t]:
+            if n['end'] - n['start'] >= GRID and h < t:
+                continue             # a long note isn't pulled back onto a 32nd
+            n['_tuplet'] = True
+            n['_tuplet_start'], n['_tuplet_end'] = h, h + half
+            n['_tuplet_group'] = (slot, GRID, 2, 1)
+            moved += 1
+        # the short note filling the first half of that 16th becomes the other 32nd
+        for s in starts:
+            if s in placed or quantize(s) != slot:
+                continue
+            for n in by_onset[s]:
+                # (a note of the same pitch always does, however long it was
+                # held: its key is struck again half a 16th later)
+                if not n.get('_tuplet') and (
+                        any(n['pitch'] == m['pitch'] for m in by_onset[t])
+                        or (n['end'] - n['start'] < GRID and any(
+                            abs(n['pitch'] - m['pitch']) <= SUBGRID_MAX_PITCH_GAP for m in by_onset[t]))):
+                    n['_tuplet'] = True
+                    n['_tuplet_start'], n['_tuplet_end'] = slot, slot + half
+                    n['_tuplet_group'] = (slot, GRID, 2, 0)
+    return moved
+
+
+def resolve_rejected_tuplet_collisions(notes, rejected_windows):
+    """For each rejected tuplet-candidate window from detect_tuplet_groups
+    (an exact onset-count match that failed the fit-tolerance check --
+    see TUPLET_FIT_TOLERANCE_PCT), check whether any of its members would
+    still land on the same outer-grid tick under plain independent
+    quantize(). If so, push each colliding onset forward to the next free
+    grid tick -- a local, minimal separation -- instead of letting it
+    silently overlap the note before it.
+
+    This exists specifically for the gap detect_subgrid_clusters can't
+    cover: that function excludes any note >= one grid unit long
+    (SUBGRID_MAX_NOTE_DURATION_FACTOR), correctly, since a long-held
+    chord note isn't an ornament -- but that leaves a genuinely long,
+    correctly-excluded held note free to collide with unrelated material
+    once a candidate tuplet window containing it gets (correctly)
+    rejected as not-actually-a-tuplet. Found via RiverFlowInYou.mid tick
+    ~6114: loosening the accept/reject threshold enough to keep that
+    group would also re-accept a genuinely bad group elsewhere (see
+    TUPLET_FIT_TOLERANCE_PCT's comment) -- the threshold itself can't fix
+    this, only a separate collision-repair step can.
+
+    Deliberately NOT a blind scan for coincidental same-tick landings
+    anywhere in the piece: only members of a window detect_tuplet_groups
+    already evaluated and rejected are ever touched. That's what makes
+    this safe against ordinary chords -- detect_tuplet_groups' by_onset
+    grouping already guarantees a window's members are distinct onsets,
+    never simultaneous chord notes, since a chord collapses to a single
+    onset there before window-building ever happens.
+
+    Adjusts 'start'/'end' in place, shifted by the same delta so each
+    note's real recorded duration is preserved -- NOT 'f_start'/'f_end'
+    directly, so the shift flows through resolve_note_durations' normal
+    quantize()/tie-budget logic exactly like any other note. A nudged
+    note is not tagged '_tuplet' and gets no special-casing later. Skips
+    any window member already tagged '_tuplet' by a later
+    detect_subgrid_clusters pass, since that note already has a
+    resolved, trusted onset.
+
+    A real quantize-tick collision only gets repaired if the colliding
+    pair's pitches are within SUBGRID_MAX_PITCH_GAP -- the same gate
+    detect_subgrid_clusters uses, and for the same reason: found via
+    real data (control files kalank/sukoon) that most "collisions" a
+    rejected window turns up are an ordinary bass note and a melody/chord
+    note struck together across hands (e.g. pitch 46 vs 65, ~19
+    semitones apart) that are SUPPOSED to land on the same tick --
+    nudging those apart would actively damage the output, not fix it.
+    A close pitch gap (same register, plausibly the same line) is the
+    signal that two onsets are genuinely sequential melodic content that
+    happens to collide, not an intentional simultaneity.
+
+    A SECOND gate, also found via the same control-file check: pitch
+    proximity alone still wasn't enough -- two long, sustained notes a
+    few ticks apart (e.g. two ~1000-tick notes an octave apart, clearly
+    a chord/doubling struck together with ordinary jitter) passed the
+    pitch gate and were still wrongly getting nudged apart. This
+    function's actual purpose (per the RiverFlowInYou tick ~6114 case
+    that motivated it) is specifically a genuinely long HELD note
+    colliding with an unrelated SHORT, fast-passage note -- so require
+    at least one of the pair to be short (< SUBGRID_MAX_NOTE_DURATION_FACTOR
+    x GRID, the same "short enough to be a fast/ornamental note" cutoff
+    detect_subgrid_clusters already uses). Two long notes colliding is
+    left alone -- that's ordinary simultaneity, not the target case.
+
+    A collision that fails either gate is left exactly as plain
+    quantization would leave it -- untouched, same as before this
+    function existed.
+
+    Mutates notes in place. Returns the number of notes nudged."""
+    if not rejected_windows:
+        return 0
+
+    by_onset = defaultdict(list)
+    for n in notes:
+        by_onset[n['start']].append(n)
+    max_short_dur = GRID * SUBGRID_MAX_NOTE_DURATION_FACTOR
+
+    nudged = 0
+    for window in rejected_windows:
+        eligible = sorted(t for t in window if any(not n.get('_tuplet') for n in by_onset.get(t, [])))
+        if len(eligible) < 2:
+            continue
+        prev_assigned = None
+        prev_t = None
+        for t in eligible:
+            q = quantize(t)
+            if prev_assigned is not None and q <= prev_assigned:
+                prev_notes = by_onset.get(prev_t, [])
+                cand_notes = by_onset[t]
+                prev_pitches = [n['pitch'] for n in prev_notes]
+                cand_pitches = [n['pitch'] for n in cand_notes]
+                one_is_short = (any((n['end'] - n['start']) < max_short_dur for n in prev_notes)
+                                 or any((n['end'] - n['start']) < max_short_dur for n in cand_notes))
+                if (prev_pitches and cand_pitches and one_is_short
+                        and min(abs(a - b) for a in prev_pitches for b in cand_pitches)
+                        <= SUBGRID_MAX_PITCH_GAP):
+                    q = prev_assigned + GRID
+            if q != quantize(t):
+                delta = q - t
+                for n in by_onset[t]:
+                    if n.get('_tuplet'):
+                        continue
+                    n.setdefault('_played_start', n['start'])   # detect_ornaments wants the real onset
+                    n['start'] += delta
+                    n['end'] += delta
+                    nudged += 1
+            prev_assigned = q
+            prev_t = t
+    return nudged
 
 
 def resolve_note_durations(notes, temperature=0.0, bar_ticks=None):
@@ -753,6 +1184,12 @@ def classify_voice_roles(notes):
         n['voice_confidence'] = round(abs(score - 0.5) * 2, 2)
 
 
+# See the grouping comment in optimize_staff_durations. Counted on the test
+# files before choosing: at 4x this splits 0-1 chords in RiverFlowInYou and
+# 9-19 (of 121-210) in the two pedaled pieces; at 2x it would split 15-69.
+HELD_SPLIT_RATIO = 4
+
+
 def optimize_staff_durations(notes, temperature, bar_ticks, weights=None, stats=None,
                               melody_preservation=False):
     """The core engraving decision for one staff, run after
@@ -825,12 +1262,31 @@ def optimize_staff_durations(notes, temperature, bar_ticks, weights=None, stats=
     for n in notes:
         by_onset[n['f_start']].append(n)
 
+    # Notes struck together share one written length (the shortest
+    # member's), so a chord never fractures over small differences in
+    # release. The exception is a note really HELD while its chord-mate is
+    # only touched -- a melody note sustained four beats over a passing
+    # 16th. Sharing a length there writes the held note as a 16th and a
+    # bar of rests. So a member held HELD_SPLIT_RATIO times longer than
+    # the shortest, and at least a beat longer, starts its own group and
+    # keeps its own length. Notes already placed by tuplet / fast-note
+    # detection keep the slot they were given.
+    groups = []
     for onset, event in by_onset.items():
-        if all(n.get('_tuplet') for n in event):
-            # already evenly divided and f_end already set by
-            # resolve_note_durations -- the whole point is even
-            # division, not a cost-optimal choice, so leave it alone
+        members = sorted((n for n in event if not n.get('_tuplet')), key=lambda n: n['nat_units'])
+        if not members:
             continue
+        group = [members[0]]
+        for n in members[1:]:
+            if (n['nat_units'] >= HELD_SPLIT_RATIO * group[0]['nat_units']
+                    and n['nat_units'] - group[0]['nat_units'] >= 4 * GRID_SCALE):
+                groups.append((onset, group))
+                group = [n]
+            else:
+                group.append(n)
+        groups.append((onset, group))
+
+    for onset, event in groups:
 
         bar_start = (onset // bar_ticks) * bar_ticks
         bar_room_units = max(1, (bar_start + max_bars * bar_ticks - onset) // GRID)
@@ -1092,6 +1548,85 @@ def read_tempo_curve(mid, tick_scale=1.0):
     return curve
 
 
+# Thresholds for flagging a multi-event tempo curve as more likely to be
+# transcription timing jitter mislabeled as tempo changes than genuine
+# macro tempo direction (verse/chorus rubato, a real accelerando, etc).
+# Calibrated against exactly one real problem case (RiverFlowInYou.mid:
+# 3.05x between slowest/fastest event, up to a 39 BPM jump between
+# adjacent events one beat apart) -- there's no second erratic-curve
+# example yet to confirm these generalize, so treat this as a first-pass
+# heuristic to warn/redefault on, not a proven boundary. Revisit with more
+# real multi-tempo files if it ever mis-flags a genuine rubato piece.
+TEMPO_CURVE_RATIO_THRESHOLD = 2.0
+TEMPO_CURVE_JUMP_THRESHOLD_BPM = 20.0
+
+# Jitter is dense; a deliberate tempo change is not. The two thresholds
+# above, applied alone, flagged a single genuine section change (e.g.
+# 140 -> 80 BPM thirty bars in, as an orchestral or DAW export carries) as
+# "erratic", discarding it and playing the rest of the piece at the
+# opening tempo. So:
+# - a >TEMPO_CURVE_JUMP_THRESHOLD_BPM jump only counts as jitter when its
+#   two events are less than TEMPO_JUMP_MAX_SPACING_BEATS apart
+#   (RiverFlowInYou's big jumps are all 1-2 beats apart);
+# - the slowest/fastest ratio test only applies when the curve is dense,
+#   i.e. its events average less than TEMPO_DENSE_SPACING_BEATS apart
+#   (RiverFlowInYou: about one event per bar).
+# Same single real positive case as above, plus one synthetic negative (a
+# sparse two-event section change). RiverFlowInYou is still flagged
+# exactly as before.
+TEMPO_JUMP_MAX_SPACING_BEATS = 4
+TEMPO_DENSE_SPACING_BEATS = 8
+
+
+def assess_tempo_curve(curve):
+    """curve: a read_tempo_curve() result, [(tick, raw_tempo), ...] in tick
+    order, ticks in the internal TICKS_PER_BEAT space. Returns (is_erratic,
+    ratio, max_jump) -- ratio is slowest/fastest spread, max_jump is the
+    largest BPM change between adjacent events (reported regardless of
+    spacing). See the threshold constants above for what counts as
+    'erratic'."""
+    ticks = [t for t, _ in curve]
+    bpms = [round(mido.tempo2bpm(v), 1) for _, v in curve]
+    ratio = max(bpms) / min(bpms) if min(bpms) > 0 else float('inf')
+    pairs = list(zip(bpms, bpms[1:], ticks, ticks[1:]))
+    max_jump = max((abs(b - a) for a, b, _, _ in pairs), default=0.0)
+    close_jump = max((abs(b - a) for a, b, ta, tb in pairs
+                      if (tb - ta) < TEMPO_JUMP_MAX_SPACING_BEATS * TICKS_PER_BEAT), default=0.0)
+    avg_spacing_beats = (ticks[-1] - ticks[0]) / max(1, len(ticks) - 1) / TICKS_PER_BEAT
+    dense = avg_spacing_beats < TEMPO_DENSE_SPACING_BEATS
+    is_erratic = ((dense and ratio > TEMPO_CURVE_RATIO_THRESHOLD)
+                  or close_jump > TEMPO_CURVE_JUMP_THRESHOLD_BPM)
+    return is_erratic, ratio, max_jump
+
+
+def estimate_representative_tempo(mid, notes):
+    """Best single flat-tempo guess when there's no tempo curve worth
+    trusting (none present, a single generic-default stamp, or a
+    multi-event curve judged too erratic to be genuine tempo direction).
+    Prefers the source file's own declared tempo if it looks like it was
+    actually measured (not the untouched MIDI spec default); falls back
+    to rhythm-based estimation from note-onset spacing otherwise. Returns
+    (tempo, description) where description explains which path was used,
+    for the caller to report however fits its own messaging."""
+    detected, tempo_is_generic = detect_source_tempo(mid)
+    if detected is not None and not tempo_is_generic:
+        return detected, f"using source file tempo: {detected} BPM"
+    prefix = ""
+    if detected is not None and tempo_is_generic:
+        prefix = (f"source file tempo ({detected} BPM) is byte-identical to the untouched MIDI spec "
+                  f"default, which most transcription tools stamp automatically without actually "
+                  f"measuring it. Falling through to rhythm-based estimation instead.\n")
+    ranked = estimate_tempo_candidates(mid, notes)
+    estimated = ranked[0][0] if ranked else None
+    tempo = estimated if estimated is not None else 120.0
+    desc = prefix + (f"estimated from note-onset rhythm: {tempo} BPM" if estimated is not None else
+                      f"no usable tempo info at all -- using neutral default: {tempo} BPM")
+    ambiguity = describe_tempo_ambiguity(ranked) if ranked else None
+    if ambiguity:
+        desc += f"\n{ambiguity}"
+    return tempo, desc
+
+
 def rebase_tempo_curve(curve, leading_offset):
     """Shift a read_tempo_curve() result to start at the same zero-point
     as leading-silence-rebased notes. Events at or before leading_offset
@@ -1174,10 +1709,17 @@ def estimate_tempo_candidates(mid, notes):
     full ranked list of (bpm, score) candidates (best first, lower score
     = better fit) instead of just the winner, so callers can detect and
     report near-tied octave ambiguity. Returns [] if there isn't enough
-    onset data."""
+    onset data.
+
+    `notes` must already be in the internal TICKS_PER_BEAT space (both
+    callers rescale by tick_scale before calling this), so ticks are
+    converted to seconds at TICKS_PER_BEAT -- NOT the source file's own
+    ticks_per_beat. Using the source's value here double-counted the
+    rescale on any non-384-PPQ file: a 120 BPM eighth-note pulse read back
+    as 75 BPM from a 480-PPQ file and 150 BPM from a 960-PPQ one."""
     scaling_bpm, _ = detect_source_tempo(mid)
     scaling_tempo = mido.bpm2tempo(scaling_bpm or 120.0)
-    tpb = mid.ticks_per_beat
+    tpb = TICKS_PER_BEAT
 
     onset_ticks = sorted(set(n['start'] for n in notes))
     if len(onset_ticks) < 8:
@@ -1338,7 +1880,24 @@ def assign_hands(notes, max_hand_span=16, ambiguity_zone=3):
       (b) doing so doesn't push either hand's resulting pitch-cluster
           for this onset past max_hand_span semitones -- a hand can't
           physically stretch further than that regardless of what
-          continuity would prefer.
+          continuity would prefer;
+      (c) it isn't a solo note (the only note at its onset) sitting
+          inside an unbroken run of its own naively-assigned hand --
+          i.e. when a note has no simultaneous chord-mate, at least one
+          of the immediately neighboring onsets must ALSO naively
+          belong to the other hand. Without this, a single melodic dip
+          in the middle of one continuous phrase (both neighbors
+          naively the same hand as the note itself) can get mistaken
+          for a hand crossing purely because a locally-shifted split
+          point (--dynamic-split) happens to put it in the ambiguity
+          zone; centroid distance alone can't tell "boundary-hugging
+          note that's really part of the OTHER hand's phrase" apart
+          from "brief dip within THIS hand's own phrase" -- neighbor
+          naive-hand agreement can. This guard only applies to solo
+          onsets: a note with a simultaneous chord-mate (e.g. an
+          octave/interval doubling meant to be split across hands) is
+          a deliberate voicing decision, not a passing tone, so it's
+          still governed only by (a) and (b).
 
     Mutates each note's new 'hand' field ('treble'/'bass'); doesn't
     touch pitch, timing, or anything else. Returns (reassigned_count,
@@ -1362,16 +1921,26 @@ def assign_hands(notes, max_hand_span=16, ambiguity_zone=3):
         n['hand'] = 'treble' if n['pitch'] >= n['_split_pitch'] else 'bass'
     naive = {id(n): n['hand'] for n in notes}
 
+    naive_hands_at = [set(naive[id(n)] for n in by_onset[onset]) for onset in onsets]
+
     prev_centroid = {'treble': None, 'bass': None}
     warnings = []
-    for onset in onsets:
+    for i, onset in enumerate(onsets):
         event = by_onset[onset]
         split = event[0]['_split_pitch']
+
+        neighbor_hands = set()
+        if i > 0:
+            neighbor_hands |= naive_hands_at[i - 1]
+        if i + 1 < len(onsets):
+            neighbor_hands |= naive_hands_at[i + 1]
 
         for n in event:
             if abs(n['pitch'] - split) > ambiguity_zone:
                 continue
             other = 'bass' if n['hand'] == 'treble' else 'treble'
+            if len(event) == 1 and other not in neighbor_hands:
+                continue
             if prev_centroid[other] is None:
                 continue
             dist_current = (abs(n['pitch'] - prev_centroid[n['hand']])
@@ -1568,6 +2137,989 @@ def report(name, notes, bar_ticks, opt_stats=None):
               file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------
+# Ornament detection (experimental) -- recognizes mordents, turns and trills
+# as figures. Only tags notes; never changes timing or MIDI output. The
+# MusicXML writer collapses a tagged figure into one note with an ornament
+# symbol.
+# ---------------------------------------------------------------------------
+
+# An ornament's notes must follow each other faster than a 32nd note at the
+# notated tempo. Chosen from real data: the figures in RiverFlowInYou that
+# are ornaments by ear and by its reference score have 24-47 tick gaps
+# between notes, while its ordinary 16th-note runs with the same pitch
+# shapes (e.g. note, step up, back) sit at 90-95 ticks. Nothing in between
+# was found, so a 32nd (48 ticks) separates them with room on both sides.
+# One piece's worth of calibration, like the tuplet thresholds above.
+ORNAMENT_MAX_IOI = TICKS_PER_BEAT // 8
+ORNAMENT_CHORD_TOLERANCE = 6     # onsets this close (ticks) count as struck together
+ORNAMENT_MAX_STEP = 2            # a neighbor note is a half or whole step away
+TRILL_MIN_NOTES = 5              # shortest alternation called a trill (e.g. A B A B A)
+
+
+def detect_ornaments(notes, id_start=0):
+    """Find mordents, turns and trills in ONE staff's notes, using the raw
+    (unquantized) onsets. Run after hands are assigned, so a figure can
+    never straddle the two staves.
+
+    A figure is a run of lone notes, each followed within ORNAMENT_MAX_IOI
+    by the next, moving by step around one principal pitch and ending on a
+    landing note:
+      mordent           P, lower neighbor, P
+      inverted-mordent  P, upper neighbor, P      (the sign without the stroke)
+      turn              upper, P, lower, P   or   P, upper, P, lower, P
+      inverted-turn     lower, P, upper, P   or   P, lower, P, upper, P
+      trill             two pitches a step apart alternating, 5+ notes
+    The landing note may be part of a chord; the quick notes before it may
+    not. Longest pattern wins, so a trill is never read as a chain of
+    mordents. A note inside a beat-scale tuplet group (quintuplet etc.) is
+    never part of a figure -- that passage already has an explicit rhythm.
+
+    Tags each quick note with '_orn_aux' (the figure id) and the landing
+    note with '_orn' (type, principal pitch, neighbor pitches). Nothing
+    else is touched. Returns a list of (type, landing_note) per figure."""
+    def played(n):   # onset as played, before any collision nudge moved it
+        return n.get('_played_start', n['start'])
+
+    ns = sorted(notes, key=lambda n: (played(n), n['pitch']))
+    groups = []
+    for n in ns:
+        if groups and played(n) - played(groups[-1][0]) <= ORNAMENT_CHORD_TOLERANCE:
+            groups[-1].append(n)
+        else:
+            groups.append([n])
+
+    def in_beat_tuplet(n):
+        return bool(n.get('_tuplet_group')) and n['_tuplet_group'][1] != GRID
+
+    def quick(j):
+        return (j + 1 < len(groups) and len(groups[j]) == 1 and not in_beat_tuplet(groups[j][0])
+                and played(groups[j + 1][0]) - played(groups[j][0]) <= ORNAMENT_MAX_IOI)
+
+    def step(d):
+        return 1 <= d <= ORNAMENT_MAX_STEP
+
+    figures = []
+    i = 0
+    while i < len(groups):
+        run = 0
+        while quick(i + run):
+            run += 1
+        # groups i .. i+run-1 are quick lone notes; group i+run is where the run lands
+        match = None
+        if run >= 2:
+            p = [groups[i + k][0]['pitch'] for k in range(run)]
+
+            def landing(k, pitch):
+                if run < k - 1:
+                    return None
+                return next((n for n in groups[i + k - 1]
+                             if n['pitch'] == pitch and not in_beat_tuplet(n)), None)
+
+            # trill: as many alternating notes as the run holds
+            if step(abs(p[0] - p[1])):
+                count = 2
+                while count <= run:
+                    want = p[count % 2]
+                    if not any(n['pitch'] == want for n in groups[i + count]):
+                        break
+                    count += 1
+                if count >= TRILL_MIN_NOTES:
+                    land = landing(count, p[(count - 1) % 2])
+                    if land is not None:
+                        match = ('trill', count, land, min(p[0], p[1]), max(p[0], p[1]), None)
+            if match is None and run >= 4:
+                P = p[0]
+                land = landing(5, P)
+                if land is not None and p[2] == P:
+                    if step(p[1] - P) and step(P - p[3]):
+                        match = ('turn', 5, land, P, p[1], p[3])
+                    elif step(P - p[1]) and step(p[3] - P):
+                        match = ('inverted-turn', 5, land, P, p[3], p[1])
+            if match is None and run >= 3:
+                P = p[1]
+                land = landing(4, P)
+                if land is not None:
+                    if step(p[0] - P) and step(P - p[2]):
+                        match = ('turn', 4, land, P, p[0], p[2])
+                    elif step(P - p[0]) and step(p[2] - P):
+                        match = ('inverted-turn', 4, land, P, p[2], p[0])
+            if match is None:
+                P = p[0]
+                land = landing(3, P)
+                if land is not None:
+                    if step(p[1] - P):
+                        match = ('inverted-mordent', 3, land, P, p[1], None)
+                    elif step(P - p[1]):
+                        match = ('mordent', 3, land, P, None, p[1])
+        if match is None:
+            i += 1
+            continue
+        kind, size, land, principal, upper, lower = match
+        fid = id_start + len(figures) + 1
+        for k in range(size - 1):
+            groups[i + k][0]['_orn_aux'] = fid
+        land['_orn'] = {'id': fid, 'type': kind, 'pitch': principal, 'upper': upper, 'lower': lower}
+        figures.append((kind, land))
+        i += size
+    return figures
+
+
+# ---------------------------------------------------------------------------
+# Key estimation and pitch spelling. Only MusicXML needs these: a MIDI note
+# number doesn't say whether it's a C# or a Db, a written note has to.
+# ---------------------------------------------------------------------------
+
+# Temperley's key profiles (how strongly each scale degree belongs to a
+# major / minor key), correlated against the piece's own duration-weighted
+# pitch-class histogram. Chosen by test, not taste: on 50 engraved scores
+# from the music21 corpus (Bach chorales plus Chopin, Schumann, Mozart,
+# Beethoven, Joplin, Haydn, Schubert, Handel) these picked the printed key
+# signature 47 times; the better-known Krumhansl-Kessler profiles managed 37.
+_KEY_PROFILE = {
+    'major': (5.0, 2.0, 3.5, 2.0, 4.5, 4.0, 2.0, 4.5, 2.0, 3.5, 1.5, 4.0),
+    'minor': (5.0, 2.0, 3.5, 4.5, 2.0, 4.0, 2.0, 4.5, 3.5, 2.0, 1.5, 4.0),
+}
+_FIFTHS_LETTERS = 'FCGDAEB'       # line of fifths: F=-1, C=0, G=1, ... then F#=6, C#=7, ...
+_SCALE_LETTERS = 'CDEFGAB'
+_LETTER_PC = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
+_ACCIDENTAL_NAME = {-2: 'flat-flat', -1: 'flat', 0: 'natural', 1: 'sharp', 2: 'double-sharp'}
+
+
+def _lof_name(pos):
+    """Line-of-fifths position -> (letter, alter)."""
+    return _FIFTHS_LETTERS[(pos + 1) % 7], (pos + 1) // 7
+
+
+def _fifths_for(tonic_pc, mode):
+    major_pc = tonic_pc if mode == 'major' else (tonic_pc + 3) % 12
+    f = (major_pc * 7) % 12
+    if f > 6 or (f == 6 and mode == 'minor'):
+        f -= 12       # 6 sharps for F# major, but 6 flats for Eb minor
+    return f
+
+
+def key_name(fifths, mode):
+    letter, alter = _lof_name(fifths + (3 if mode == 'minor' else 0))
+    sig = 'no sharps or flats' if fifths == 0 else f"{abs(fifths)} {'sharp' if fifths > 0 else 'flat'}{'s' if abs(fifths) != 1 else ''}"
+    return f"{letter}{'#' * alter if alter > 0 else 'b' * -alter} {mode} ({sig})"
+
+
+def parse_key(s):
+    """'A', 'F#m', 'Bb minor', 'Eb major', or a number of sharps (+) / flats
+    (-) like '-3' -> (fifths, mode)."""
+    s = s.strip()
+    try:
+        fifths = int(s)
+    except ValueError:
+        m = re.fullmatch(r'([A-Ga-g])\s*([#b]?)\s*(m|min|minor|maj|major)?', s)
+        if not m:
+            raise ValueError("expected a key like A, F#m, 'Bb minor', or a number of sharps/flats like -3")
+        mode = 'minor' if m.group(3) in ('m', 'min', 'minor') else 'major'
+        pos = _FIFTHS_LETTERS.index(m.group(1).upper()) - 1 + 7 * {'#': 1, 'b': -1, '': 0}[m.group(2)]
+        return _checked_fifths(pos - (3 if mode == 'minor' else 0)), mode
+    return _checked_fifths(fifths), 'major'
+
+
+def _checked_fifths(fifths):
+    if not -7 <= fifths <= 7:
+        raise ValueError("that key needs more than 7 sharps or flats")
+    return fifths
+
+
+def estimate_key(notes):
+    """Best-fitting key for the whole piece. Returns (fifths, mode,
+    runner_up) where runner_up is (fifths, mode) of the best candidate with
+    a DIFFERENT key signature if it fits nearly as well (so the caller can
+    say the call was close), else None. A relative major/minor mix-up (C
+    major vs A minor) doesn't matter for the key signature and is never
+    reported as ambiguity."""
+    hist = [0.0] * 12
+    for n in notes:
+        hist[n['pitch'] % 12] += max(1, n['f_end'] - n['f_start'])
+    if not any(hist):
+        return 0, 'major', None
+    mean_h = sum(hist) / 12
+    dev_h = [h - mean_h for h in hist]
+    norm_h = sum(d * d for d in dev_h) ** 0.5 or 1.0
+    scored = []
+    for mode, prof in _KEY_PROFILE.items():
+        mean_p = sum(prof) / 12
+        dev_p = [x - mean_p for x in prof]
+        norm_p = sum(d * d for d in dev_p) ** 0.5
+        for tonic in range(12):
+            r = sum(dev_h[(tonic + k) % 12] * dev_p[k] for k in range(12)) / (norm_h * norm_p)
+            scored.append((r, _fifths_for(tonic, mode), mode))
+    scored.sort(key=lambda x: -x[0])
+    best_r, fifths, mode = scored[0]
+    runner = next(((f, m) for r, f, m in scored[1:] if f != fifths and r >= best_r - 0.05), None)
+    return fifths, mode, runner
+
+
+def _key_alter(letter, fifths):
+    i = _FIFTHS_LETTERS.index(letter)
+    if fifths > i:
+        return 1
+    if fifths < 0 and (6 - i) < -fifths:
+        return -1
+    return 0
+
+
+def spell_pitch(pitch, fifths, mode, lean=0):
+    """MIDI pitch -> (letter, alter, octave) for a key.
+
+    Every pitch class gets the spelling nearest the key on the line of
+    fifths: a major key takes its chromatic notes as b2 b3 #4 b6 b7, a
+    minor key (same signature) leans sharp so its raised 6th/7th and the
+    major 3rd come out as sharps (G#, not Ab, in A minor). lean=+1 / -1
+    asks for the sharp / flat spelling of a note outside the key instead,
+    used when the line moves on by a half step up / down (see
+    spell_staff)."""
+    lo = fifths - (2 if mode == 'minor' else 5)
+    pos = lo + ((pitch * 7 - lo) % 12)
+    if lean > 0 and pos < fifths - 1 and pos + 12 <= fifths + 10:
+        pos += 12
+    elif lean < 0 and pos > fifths + 5 and pos - 12 >= fifths - 6:
+        pos -= 12
+    letter, alter = _lof_name(pos)
+    return letter, alter, (pitch - alter) // 12 - 1
+
+
+def spell_staff(notes, fifths, mode):
+    """Set n['_spell'] = (letter, alter, octave) on every note of one staff.
+    Notes in the key are spelled by the key. A note outside the key looks
+    at where its line goes next -- the nearest pitch at the staff's next
+    onset: if that's a half step up it is spelled as a sharp (F# -> G), a
+    half step down as a flat (Ab -> G), so the resolution reads as a step
+    to a different letter. Otherwise the key's default spelling is used.
+
+    Measured on the same 50 corpus scores as the key profiles (28,274
+    notes, spelled from MIDI numbers alone and compared with the printed
+    note names): 98.9% of all notes match, and 89% of the notes outside
+    the key signature -- up from 74% without the half-step rule."""
+    by_onset = defaultdict(list)
+    for n in notes:
+        by_onset[n['f_start']].append(n)
+    onsets = sorted(by_onset)
+    nxt = {a: b for a, b in zip(onsets, onsets[1:])}
+    for n in notes:
+        lean = 0
+        following = by_onset.get(nxt.get(n['f_start']), [])
+        if following:
+            d = min((m['pitch'] - n['pitch'] for m in following), key=abs)
+            if abs(d) == 1:
+                lean = d
+        n['_spell'] = spell_pitch(n['pitch'], fifths, mode, lean)
+
+
+# ---------------------------------------------------------------------------
+# MusicXML export. Writes the score exactly as decided above -- staff per
+# hand, each note's written length and ties, tuplet groups, ornaments --
+# instead of leaving a MIDI importer to guess them again.
+# ---------------------------------------------------------------------------
+
+_NOTE_TYPES = [(Fraction(16), 'long'), (Fraction(8), 'breve'), (Fraction(4), 'whole'),
+               (Fraction(2), 'half'), (Fraction(1), 'quarter'), (Fraction(1, 2), 'eighth'),
+               (Fraction(1, 4), '16th'), (Fraction(1, 8), '32nd'), (Fraction(1, 16), '64th'),
+               (Fraction(1, 32), '128th')]
+_TYPE_OF = dict(_NOTE_TYPES)
+_ORNAMENT_TAG = {'trill': 'trill-mark', 'mordent': 'mordent', 'inverted-mordent': 'inverted-mordent',
+                 'turn': 'turn', 'inverted-turn': 'inverted-turn'}
+
+
+def _q(ticks):
+    """Internal ticks -> exact position in quarter notes."""
+    return Fraction(ticks, TICKS_PER_BEAT)
+
+
+def _note_values(length, dotted=True):
+    """Split a length (in quarters) into noteheads to tie together, largest
+    first -- the same greedy split minimal_tie_count() counts, so a note
+    gets exactly as many tied noteheads here as the optimizer budgeted for.
+    Returns [(length, type, dots), ...]."""
+    cands = []
+    for v, t in _NOTE_TYPES:
+        cands.append((v, t, 0))
+        if dotted and v >= Fraction(1, 16):
+            cands.append((v * 3 / 2, t, 1))
+    cands.sort(key=lambda c: -c[0])
+    out, rem = [], length
+    while rem > 0:
+        pick = next((c for c in cands if c[0] <= rem), None)
+        if pick is None:
+            raise ValueError(f"length {length} quarters can't be written with standard note values")
+        out.append(pick)
+        rem -= pick[0]
+    return out
+
+
+def _order_values(vals, pos):
+    """Which way round to tie a multi-notehead note. Same noteheads either
+    way (so the same tie count); pick the order that puts more of them on a
+    position their own length divides -- e.g. a 16th then a quarter when the
+    note starts a 16th before the beat, not a quarter hanging over it."""
+    def aligned(seq):
+        p, score = pos, 0
+        for v, _t, dots in seq:
+            score += (p % (v * 2 / 3 if dots else v) == 0)
+            p += v
+        return score
+    rev = vals[::-1]
+    return rev if aligned(rev) > aligned(vals) else vals
+
+
+def _rest_values(a, b, bar_start):
+    """Rests filling [a, b): at each point the longest plain rest that both
+    fits and sits on its own grid within the bar."""
+    out = []
+    while a < b:
+        pick = next(((v, t, 0) for v, t in _NOTE_TYPES if v <= b - a and (a - bar_start) % v == 0), None)
+        if pick is None:
+            raise ValueError(f"rest from {a} to {b} can't be written with standard rest values")
+        out.append(pick)
+        a += pick[0]
+    return out
+
+
+def _mx_staff_items(notes, bar_q, stats):
+    """One staff's notes -> the things a voice is made of: chords
+    ('ev': start, end, notes) and bracketed tuplet groups ('block')."""
+    grid_q = _q(GRID)
+    fig_start = {}
+    for n in notes:
+        if n.get('_orn_aux'):
+            fig_start[n['_orn_aux']] = min(fig_start.get(n['_orn_aux'], n['f_start']), n['f_start'])
+
+    plain = []                      # [start, end, note, ornament]
+    blocks = defaultdict(dict)      # (group start, span, N) -> {slot: [notes]}
+    broken = set()                  # tuplet groups that lost a member to an ornament
+    for n in notes:
+        g = n.get('_tuplet_group')
+        if n.get('_orn_aux'):
+            if g:
+                broken.add(g[:3])
+            continue
+        if n.get('_orn'):
+            # the whole figure becomes this one note, from where the figure began
+            s = (min(fig_start.get(n['_orn']['id'], n['f_start']), n['f_start']) // GRID) * GRID
+            e = -(-n['f_end'] // GRID) * GRID
+            if g:
+                broken.add(g[:3])
+            plain.append([_q(s), _q(max(e, s + GRID)), n, n['_orn']])
+        elif g:
+            blocks[g[:3]].setdefault(g[3], []).append(n)
+        else:
+            s, e = n['f_start'], n['f_end']
+            if n.get('_tuplet'):    # defensive: evenly-divided note with no group info
+                s = (s // GRID) * GRID
+                e = max(s + GRID, -(-e // GRID) * GRID)
+            plain.append([_q(s), _q(e), n, None])
+
+    items = []
+    for key, slots in blocks.items():
+        group_start, span, n_cand = key
+        a = _q(round(group_start / GRID) * GRID)    # a bracket has to start on the grid
+        b = a + _q(span)
+        crosses_bar = a // bar_q != (b - Fraction(1, 1024)) // bar_q
+        if n_cand > 2 and set(slots) == {0}:
+            # this staff only plays the group's first note (the rest of the
+            # run is in the other hand): one ordinary note, no bracket of rests
+            normal = 1 << (n_cand.bit_length() - 1)
+            for n in slots[0]:
+                plain.append([a, a + _q(span) / normal, n, None])
+            continue
+        if n_cand > 2 and key not in broken and not crosses_bar:
+            pitches = [n['pitch'] for ns in slots.values() for n in ns]
+            items.append({'kind': 'block', 'start': a, 'end': b, 'n': n_cand, 'slots': slots,
+                          'pitch': sum(pitches) / len(pitches)})
+            stats['tuplet_keys'].add(key)
+            continue
+        # Can't be drawn as one bracket: two notes sharing a 16th are simply
+        # two 32nds; a group straddling a barline, or one that an ornament
+        # took notes out of, is written as plain notes on the coarsest
+        # power-of-two grid that keeps every onset distinct.
+        bounds = None
+        for res in (grid_q, grid_q / 2, grid_q / 4, grid_q / 8):
+            cand = [a + round((_q(span) * k / n_cand) / res) * res for k in range(n_cand)] + [b]
+            if all(x < y for x, y in zip(cand, cand[1:])):
+                bounds = cand
+                break
+        if bounds is None:
+            stats['dropped'] += sum(len(ns) for ns in slots.values())
+            continue
+        if n_cand > 2 and crosses_bar:
+            stats['flattened_keys'].add(key)
+        for k, ns in slots.items():
+            for n in ns:
+                plain.append([bounds[k], bounds[k + 1], n, None])
+
+    chords = {}
+    for s, e, n, orn in plain:
+        it = chords.setdefault((s, e), {'kind': 'ev', 'start': s, 'end': e, 'notes': [], 'orn': None})
+        it['notes'].append(n)
+        it['orn'] = it['orn'] or orn
+    for it in chords.values():
+        it['pitch'] = sum(n['pitch'] for n in it['notes']) / len(it['notes'])
+        items.append(it)
+    return items
+
+
+def _mx_assign_voices(items, max_voices, stats):
+    """Give every item a voice number (1 = upper). ScorePrep's durations
+    let notes in one staff overlap freely -- fine in MIDI, but on paper
+    every overlap needs its own voice, and a pedaled arpeggio can stack up
+    eight deep.
+
+    First, fit the staff into max_voices lines: an item joins a line
+    that's free (the one that last played nearest its pitch); if none is
+    free and max_voices are already going, the sounding note nearest in
+    pitch is cut off where the new one starts -- how the passage would be
+    written by hand, with the ring-over left to the pedal. Two items
+    starting together that can't each have a line become one chord.
+
+    Then number them. An item is voice 1 unless something higher sounds
+    during it (now or later), in which case it sits that many voices
+    down -- so a note playing alone is always voice 1, and a held bass
+    note under a moving line is voice 2 from its first beat, not only
+    once the line enters.
+
+    Before either: a note that only just overlaps the next one -- its last
+    16th, or its last quarter of its own length, whichever is more -- is
+    simply ended where that next note starts. That's fingers holding over
+    (legato), not a second voice, and writing it as one would hang a whole
+    extra voice and a bar of rests on a 16th of overlap."""
+    grid_q = _q(GRID)
+    items.sort(key=lambda it: (it['start'], -it['pitch']))
+    lines, placed = [], []
+    for it in items:
+        for v in lines:
+            x = v['last']
+            if (x['kind'] == 'ev' and x['start'] < it['start'] < x['end']
+                    and x['end'] - it['start'] <= max(grid_q, (x['end'] - x['start']) / 4)):
+                x['end'] = it['start']
+                stats['trimmed'] += len(x['notes'])
+        near = lambda v: abs(v['last']['pitch'] - it['pitch'])
+        free = [v for v in lines if v['last']['end'] <= it['start']]
+        if free:
+            v = min(free, key=near)
+        elif len(lines) < max_voices:
+            v = {}
+            lines.append(v)
+        else:
+            cuttable = [v for v in lines if v['last']['kind'] == 'ev']
+            together = [v for v in cuttable if v['last']['start'] == it['start']]
+            earlier = [v for v in cuttable if v['last']['start'] < it['start']]
+            if it['kind'] == 'ev' and together:
+                host = min(together, key=near)['last']
+                host['notes'].extend(it['notes'])
+                host['orn'] = host['orn'] or it['orn']
+                host['pitch'] = sum(n['pitch'] for n in host['notes']) / len(host['notes'])
+                stats['merged'] += len(it['notes'])
+                continue
+            if not earlier:
+                # only tuplet groups are sounding, and those can't be cut
+                stats['dropped'] += (len(it['notes']) if it['kind'] == 'ev'
+                                     else sum(len(x) for x in it['slots'].values()))
+                continue
+            v = min(earlier, key=near)
+            v['last']['end'] = it['start']
+            stats['shortened'] += len(v['last']['notes'])
+        v['last'] = it
+        placed.append(it)
+
+    placed.sort(key=lambda it: (it['start'], -it['pitch']))
+    sounding = []
+    for i, it in enumerate(placed):
+        sounding = [o for o in sounding if o['end'] > it['start']]
+        j = i + 1
+        while j < len(placed) and placed[j]['start'] < it['end']:
+            j += 1
+        marks = []
+        for o in sounding + placed[i + 1:j]:
+            if o['pitch'] > it['pitch']:
+                marks += [(max(o['start'], it['start']), 1), (min(o['end'], it['end']), -1)]
+        depth = above = 0
+        for _t, d in sorted(marks):
+            depth += d
+            above = max(above, depth)
+        want = min(max_voices, 1 + above)
+        taken = {o['voice'] for o in sounding}
+        it['voice'] = min((v for v in range(1, max_voices + 1) if v not in taken),
+                          key=lambda v: (abs(v - want), v), default=want)
+        sounding.append(it)
+    return placed
+
+
+def _mx_ornament(orn, fifths, mode):
+    """<ornaments> element for a detected figure, with an accidental above
+    or below the sign when the neighbor note isn't the one the key
+    signature would give."""
+    letter, alter, _octave = spell_pitch(orn['pitch'], fifths, mode)
+    natural = orn['pitch'] - alter
+    idx = _SCALE_LETTERS.index(letter)
+    marks = ''
+    for placement, pitch, to in (('above', orn['upper'], 1), ('below', orn['lower'], -1)):
+        if pitch is None:
+            continue
+        nb = _SCALE_LETTERS[(idx + to) % 7]
+        gap = (_LETTER_PC[nb] - _LETTER_PC[letter]) % 12 if to > 0 else -((_LETTER_PC[letter] - _LETTER_PC[nb]) % 12)
+        nb_alter = pitch - (natural + gap)
+        if nb_alter != _key_alter(nb, fifths) and nb_alter in _ACCIDENTAL_NAME:
+            marks += f'<accidental-mark placement="{placement}">{_ACCIDENTAL_NAME[nb_alter]}</accidental-mark>'
+    return f'<ornaments><{_ORNAMENT_TAG[orn["type"]]}/>{marks}</ornaments>'
+
+
+def _mx_staff_measures(items, n_measures, bar_q, dotted, fifths, mode):
+    """Lay one staff's voiced items out bar by bar. Returns, per measure, a
+    list of voices, each a list of element dicts (note / rest / forward)."""
+    per = [defaultdict(list) for _ in range(n_measures)]
+    for it in items:
+        if it['kind'] == 'block':
+            per[int(it['start'] // bar_q)][it['voice']].append((it['start'], it['end'], it, True, True))
+            continue
+        a = it['start']
+        while a < it['end']:
+            m = int(a // bar_q)
+            b = min(it['end'], (m + 1) * bar_q)
+            per[m][it['voice']].append((a, b, it, a == it['start'], b == it['end']))
+            a = b
+
+    def chord_pitches(it):
+        seen = {}
+        for n in it['notes']:
+            is_landing = it['orn'] is not None and n.get('_orn') is it['orn']
+            pitch = it['orn']['pitch'] if is_landing else n['pitch']
+            spell = spell_pitch(pitch, fifths, mode) if is_landing else n['_spell']
+            seen.setdefault(pitch, (pitch, spell, n['vel']))
+        return [seen[p] for p in sorted(seen)]
+
+    measures = []
+    for m in range(n_measures):
+        m0, m1 = m * bar_q, (m + 1) * bar_q
+        out = []
+        if not per[m]:
+            out.append([{'x': 'rest', 'pos': m0, 'dur': bar_q, 'measure': True, 'voice': 1}])
+        for vi, voice in enumerate(sorted(per[m])):
+            els, cur = [], m0
+
+            def fill(a, b):
+                if vi == 0:     # the staff's top voice in this bar shows its rests
+                    for v, t, d in _rest_values(a, b, m0):
+                        els.append({'x': 'rest', 'pos': a, 'dur': v, 'type': t, 'dots': d, 'voice': voice})
+                        a += v
+                else:           # other voices just skip ahead
+                    els.append({'x': 'forward', 'pos': a, 'dur': b - a, 'voice': voice})
+
+            for a, b, it, first, last in sorted(per[m][voice], key=lambda seg: seg[0]):
+                if a > cur:
+                    fill(cur, a)
+                if it['kind'] == 'block':
+                    n = it['n']
+                    normal = 1 << (n.bit_length() - 1)
+                    slot = (b - a) / n
+                    for k in range(n):
+                        el = {'pos': a + k * slot, 'dur': slot, 'type': _TYPE_OF[(b - a) / normal], 'dots': 0,
+                              'voice': voice, 'tm': (n, normal),
+                              'tuplet': 'start' if k == 0 else 'stop' if k == n - 1 else None}
+                        if k in it['slots']:
+                            el.update(x='note', tie_stop=False, tie_start=False, orn=None,
+                                      pitches=chord_pitches({'notes': it['slots'][k], 'orn': None}))
+                        else:
+                            el['x'] = 'rest'
+                        els.append(el)
+                else:
+                    vals = _order_values(_note_values(b - a, dotted), a - m0)
+                    pitches = chord_pitches(it)
+                    pos = a
+                    for i, (v, t, d) in enumerate(vals):
+                        els.append({'x': 'note', 'pos': pos, 'dur': v, 'type': t, 'dots': d, 'voice': voice,
+                                    'pitches': pitches,
+                                    'tie_stop': not (first and i == 0),
+                                    'tie_start': not (last and i == len(vals) - 1),
+                                    'orn': (_mx_ornament(it['orn'], fifths, mode)
+                                            if it['orn'] is not None and first and i == 0 else None)})
+                        pos += v
+                cur = b
+            if cur < m1 and vi == 0:
+                fill(cur, m1)
+            out.append(els)
+
+        # accidentals, in time order across the staff's voices
+        state = {}
+        for el in sorted((e for els in out for e in els if e['x'] == 'note'), key=lambda e: e['pos']):
+            el['acc'] = []
+            for _pitch, (letter, alter, octave), _vel in el['pitches']:
+                shown = None
+                if not el['tie_stop']:
+                    if alter != state.get((letter, octave), _key_alter(letter, fifths)):
+                        shown = _ACCIDENTAL_NAME.get(alter)
+                    state[(letter, octave)] = alter
+                el['acc'].append(shown)
+        measures.append(out)
+    return measures
+
+
+def write_musicxml(path, treble, bass, time_sig, bar_ticks, tempo, tempo_curve, fifths, mode,
+                   title='', max_voices=2, dotted=True):
+    """Write the finished score as MusicXML: one piano part, treble staff
+    from `treble`, bass staff from `bass`, both already carrying their
+    final 'f_start'/'f_end' and '_spell'. Returns a stats dict (voices cut,
+    tuplets written, ...) for run() to report."""
+    stats = defaultdict(int)
+    stats['tuplet_keys'], stats['flattened_keys'] = set(), set()
+    bar_q = _q(bar_ticks)
+    staves = []
+    for notes in (treble, bass):
+        staves.append(_mx_assign_voices(_mx_staff_items(notes, bar_q, stats), max_voices, stats))
+    last_end = max((it['end'] for items in staves for it in items), default=bar_q)
+    n_measures = max(1, -(-last_end // bar_q))
+    laid = [_mx_staff_measures(items, n_measures, bar_q, dotted, fifths, mode) for items in staves]
+    stats['ornaments'] = sum(1 for items in staves for it in items if it['kind'] == 'ev' and it['orn'] is not None)
+    stats['measures'] = n_measures
+    stats['tuplets'] = len(stats['tuplet_keys'])
+    stats['tuplets_flattened'] = len(stats['flattened_keys'])
+    stats['voices'] = max((it['voice'] for items in staves for it in items), default=1)
+
+    tempos = ([(_q(t), mido.tempo2bpm(raw)) for t, raw in tempo_curve] if len(tempo_curve) > 1
+              else [(Fraction(0), float(tempo))])
+    tempo_at = defaultdict(list)
+    for pos, bpm in tempos:
+        m = min(n_measures - 1, int(pos // bar_q))
+        tempo_at[m].append((pos - m * bar_q, round(bpm, 2)))
+
+    # smallest <divisions> that makes every duration a whole number
+    div = 1
+    durs = [el['dur'] for staff in laid for meas in staff for els in meas for el in els]
+    durs += [off for offs in tempo_at.values() for off, _ in offs] + [bar_q]
+    for d in durs:
+        div = div * d.denominator // gcd(div, d.denominator)
+
+    def D(x):
+        return (x * div).numerator
+
+    L = ['<?xml version="1.0" encoding="UTF-8"?>',
+         '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 3.1 Partwise//EN" '
+         '"http://www.musicxml.org/dtds/partwise.dtd">',
+         '<score-partwise version="3.1">',
+         f'  <work><work-title>{xml_escape(title)}</work-title></work>',
+         '  <identification><encoding><software>ScorePrep</software></encoding></identification>',
+         '  <part-list><score-part id="P1"><part-name>Piano</part-name>'
+         '<score-instrument id="P1-I1"><instrument-name>Piano</instrument-name></score-instrument>'
+         '<midi-instrument id="P1-I1"><midi-channel>1</midi-channel><midi-program>1</midi-program>'
+         '</midi-instrument></score-part></part-list>',
+         '  <part id="P1">']
+    for m in range(n_measures):
+        L.append(f'    <measure number="{m + 1}">')
+        if m == 0:
+            L.append(f'      <attributes><divisions>{div}</divisions>'
+                     f'<key><fifths>{fifths}</fifths><mode>{mode}</mode></key>'
+                     f'<time><beats>{time_sig[0]}</beats><beat-type>{time_sig[1]}</beat-type></time>'
+                     f'<staves>2</staves>'
+                     f'<clef number="1"><sign>G</sign><line>2</line></clef>'
+                     f'<clef number="2"><sign>F</sign><line>4</line></clef></attributes>')
+        for off, bpm in tempo_at.get(m, []):
+            offset = f'<offset sound="yes">{D(off)}</offset>' if off else ''
+            L.append(f'      <direction placement="above"><direction-type><metronome>'
+                     f'<beat-unit>quarter</beat-unit><per-minute>{bpm:g}</per-minute></metronome>'
+                     f'</direction-type>{offset}<staff>1</staff><sound tempo="{bpm:g}"/></direction>')
+        m0 = m * bar_q
+        cursor = m0
+        for si, staff in enumerate(laid):
+            for els in staff[m]:
+                if cursor > m0:
+                    L.append(f'      <backup><duration>{D(cursor - m0)}</duration></backup>')
+                cursor = m0
+                for el in els:
+                    voice = el['voice'] + 4 * si
+                    tail = f'<voice>{voice}</voice>'
+                    if el['x'] == 'forward':
+                        L.append(f'      <forward><duration>{D(el["dur"])}</duration>{tail}<staff>{si + 1}</staff></forward>')
+                        cursor += el['dur']
+                        continue
+                    if not el.get('measure'):
+                        tail += f'<type>{el["type"]}</type>' + '<dot/>' * el['dots']
+                    tm = ''
+                    if el.get('tm'):
+                        tm = (f'<time-modification><actual-notes>{el["tm"][0]}</actual-notes>'
+                              f'<normal-notes>{el["tm"][1]}</normal-notes></time-modification>')
+                    tup = f'<tuplet type="{el["tuplet"]}" bracket="yes"/>' if el.get('tuplet') else ''
+                    if el['x'] == 'rest':
+                        notations = f'<notations>{tup}</notations>' if tup else ''
+                        L.append(f'      <note><rest{" measure=\"yes\"" if el.get("measure") else ""}/>'
+                                 f'<duration>{D(el["dur"])}</duration>{tail}{tm}<staff>{si + 1}</staff>{notations}</note>')
+                    else:
+                        ties = (('<tie type="stop"/>' if el['tie_stop'] else '')
+                                + ('<tie type="start"/>' if el['tie_start'] else ''))
+                        tied = (('<tied type="stop"/>' if el['tie_stop'] else '')
+                                + ('<tied type="start"/>' if el['tie_start'] else ''))
+                        for i, ((_p, (letter, alter, octave), vel), acc) in enumerate(zip(el['pitches'], el['acc'])):
+                            extra = tied + (tup + (el['orn'] or '') if i == 0 else '')
+                            L.append(f'      <note dynamics="{vel / 90 * 100:.1f}">{"<chord/>" if i else ""}'
+                                     f'<pitch><step>{letter}</step>{f"<alter>{alter}</alter>" if alter else ""}'
+                                     f'<octave>{octave}</octave></pitch>'
+                                     f'<duration>{D(el["dur"])}</duration>{ties}{tail}'
+                                     f'{f"<accidental>{acc}</accidental>" if acc else ""}{tm}'
+                                     f'<staff>{si + 1}</staff>'
+                                     f'{f"<notations>{extra}</notations>" if extra else ""}</note>')
+                    cursor += el['dur']
+        if m == n_measures - 1:
+            L.append('      <barline location="right"><bar-style>light-heavy</bar-style></barline>')
+        L.append('    </measure>')
+    L += ['  </part>', '</score-partwise>', '']
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(L))
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Beat tracking: find the beats from when the notes were actually played.
+#
+# A transcription of a live performance carries real onset times; whatever
+# tempo map came with it is some tool's guess at where the beats fall. When
+# that guess is bad (see assess_tempo_curve), the note positions in beats
+# are bad too -- flattening the tempo then keeps the wrong beat positions
+# AND throws away the timing that made them sound right. So instead: go
+# back to seconds and work the beats out here.
+# ---------------------------------------------------------------------------
+
+# How the tracker weighs its evidence. Tuned against one real case with a
+# known answer: RiverFlowInYou.mid (a rubato performance, 57-76 BPM with
+# phrase-end ritardandos) checked note by note against the published score.
+# Its own tempo map puts 68% of the score's on-beat notes on a beat; these
+# settings put 87% there. The score moves by only a point or two anywhere
+# near these values, so they are not finely balanced -- but it is one piece.
+BEAT_TRACK_TOLERANCE = 0.15          # timing scatter allowed per step, in grid steps
+BEAT_TRACK_TEMPO_STIFFNESS = 12.0    # cost of the tempo changing between two notes
+# cost of a note landing on each half-step of the beat: on the beat, then
+# 32nd / 16th / 32nd / 8th / 32nd / 16th / 32nd after it
+BEAT_TRACK_METER_COST = (0.0, 4.0, 2.0, 4.0, 0.7, 4.0, 2.0, 4.0)
+BEAT_TRACK_ORNAMENT_GAP = 0.4        # onsets closer than this (in grid steps) ride along with the note before
+# cost of a bass note (lowest note struck within 1.5 s either side) landing
+# anywhere but a strong beat. Adding this took the River test from 87% to
+# 91% of on-beat notes on beats, and 90% to 94% of the score's downbeats on
+# one consistent bar position; any value from 1.5 to 6 scored the same.
+BEAT_TRACK_BASS_COST = 3.0
+
+
+def ticks_to_seconds_fn(curve, fallback_tempo):
+    """Function mapping an internal tick to real seconds, through a
+    read_tempo_curve() result (or one flat tempo, in microseconds per beat,
+    when the curve is empty)."""
+    events = list(curve) if curve else [(0, fallback_tempo)]
+    if events[0][0] > 0:
+        events.insert(0, (0, events[0][1]))
+    ticks = [t for t, _ in events]
+    cum = [0.0]
+    for (t0, u0), (t1, _u1) in zip(events, events[1:]):
+        cum.append(cum[-1] + (t1 - t0) * u0 / 1e6 / TICKS_PER_BEAT)
+
+    def to_sec(tick):
+        lo, hi = 0, len(ticks) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if ticks[mid] <= tick:
+                lo = mid
+            else:
+                hi = mid - 1
+        return cum[lo] + (tick - ticks[lo]) * events[lo][1] / 1e6 / TICKS_PER_BEAT
+    return to_sec
+
+
+def track_beat_grid(onsets, cycle_beats=2):
+    """onsets: [(seconds, pitch), ...] for every note. Returns (per_beat,
+    anchors): per_beat is how many grid steps make a beat (4 when the
+    commonest gap between notes is a 16th), anchors is [(seconds, position
+    in grid steps), ...] for every note taken as a grid point. Positions
+    rise by whole or half steps; multiples of per_beat are beats, and
+    multiples of per_beat * cycle_beats are strong beats (bar or half-bar
+    starts). Returns (None, []) if there is too little to go on.
+
+    Each gap between consecutive notes is read as some number of grid steps
+    at some local tempo, and the whole piece's reading is chosen at once
+    (shortest-path search) to balance four things: gaps should be close to
+    a whole number of steps; the tempo shouldn't lurch between neighboring
+    notes; notes should fall on beats and 8ths more than in between
+    (BEAT_TRACK_METER_COST); and the lowest note of its surroundings -- a
+    bass note -- should fall on a strong beat (BEAT_TRACK_BASS_COST). The
+    last two are what let a slowing phrase ending be heard as slowing
+    rather than as extra beats.
+
+    Very quick notes (ornaments) aren't grid points; they're placed between
+    the two around them."""
+    from math import log, log2, exp
+    heads, lows = [], []
+    for t, p in sorted(onsets):
+        if not heads or t - heads[-1] > 0.03:
+            heads.append(t)
+            lows.append(p)
+        else:
+            lows[-1] = min(lows[-1], p)
+    gaps = [b - a for a, b in zip(heads, heads[1:]) if 0.04 < b - a < 1.2]
+    if len(gaps) < 12:
+        return None, []
+    step = max(gaps, key=lambda c: sum(exp(-log(d / c) ** 2 / 0.0128) for d in gaps))
+    # grid steps per beat: a 16th-note step unless that makes the tempo absurd
+    per_beat = 4
+    while 60 / (per_beat * step) < 45 and per_beat > 1:
+        per_beat //= 2
+    while 60 / (per_beat * step) > 190:
+        per_beat *= 2
+
+    ev, low, prev = [heads[0]], [lows[0]], heads[0]
+    for t, p in zip(heads[1:], lows[1:]):
+        if t - prev >= BEAT_TRACK_ORNAMENT_GAP * step:
+            ev.append(t)
+            low.append(p)
+        else:
+            low[-1] = min(low[-1], p)
+        prev = t
+    # a bass note: below middle C and nothing lower struck within 1.5 s either side
+    is_bass, a, b = [], 0, 0
+    for i, t in enumerate(ev):
+        while ev[a] < t - 1.5:
+            a += 1
+        while b < len(ev) and ev[b] <= t + 1.5:
+            b += 1
+        is_bass.append(low[i] < 60 and low[i] <= min(low[a:b]))
+
+    P = max(2, round(cycle_beats * per_beat * 2))      # half-steps per strong-beat cycle
+    in_beat = 2 * per_beat
+
+    def meter_cost(ph, bass):
+        f = (ph % in_beat) * 8 / in_beat
+        c = BEAT_TRACK_METER_COST[int(f)] if f == int(f) else BEAT_TRACK_METER_COST[1]
+        return c + (BEAT_TRACK_BASS_COST if bass and ph % P else 0.0)
+
+    S = 31                               # candidate local step lengths: 0.6x .. 2.5x the commonest
+    qs = [step * 2 ** (-0.7 + 2.0 * j / (S - 1)) for j in range(S)]
+    lq = [log2(q) for q in qs]
+    dl = [[(lq[x] - lq[y]) ** 2 for y in range(S)] for x in range(S)]
+    sigma = BEAT_TRACK_TOLERANCE
+    INF = float('inf')
+    cost = [[abs(lq[j] - log2(step)) * 4 + meter_cost(ph, is_bass[0]) for ph in range(P)] for j in range(S)]
+    back = []
+    for i in range(1, len(ev)):
+        d = ev[i] - ev[i - 1]
+        stiff = BEAT_TRACK_TEMPO_STIFFNESS / max(1.0, d / step)
+        mc = [meter_cost(ph, is_bass[i]) for ph in range(P)]
+        best_prev = [[None] * P for _ in range(S)]
+        for j in range(S):
+            row = dl[j]
+            for pp in range(P):
+                bc, bj = INF, 0
+                for jp in range(max(0, j - 8), min(S, j + 9)):
+                    c = cost[jp][pp] + stiff * row[jp]
+                    if c < bc:
+                        bc, bj = c, jp
+                best_prev[j][pp] = (bc, bj)
+        new = [[INF] * P for _ in range(S)]
+        bk = [[None] * P for _ in range(S)]
+        for j in range(S):
+            x = 2 * d / qs[j]            # the gap in half-steps at this local tempo
+            base = int(x)
+            for n2 in (base - 1, base, base + 1, base + 2):
+                if n2 < 1:
+                    continue
+                o = ((x - n2) / 2 / sigma) ** 2 / max(1.0, n2 / 2) ** 0.5
+                if o > 30:
+                    continue
+                for pp in range(P):
+                    ph = (pp + n2) % P
+                    c = best_prev[j][pp][0] + o + mc[ph]
+                    if c < new[j][ph]:
+                        new[j][ph] = c
+                        bk[j][ph] = (best_prev[j][pp][1], pp, n2)
+        if min(min(r) for r in new) == INF:
+            return None, []              # a gap nothing fits (shouldn't happen)
+        cost = new
+        back.append(bk)
+    j, ph = min(((j, ph) for j in range(S) for ph in range(P)), key=lambda st: cost[st[0]][st[1]])
+    steps = []
+    for bk in reversed(back):
+        j, ph, n2 = bk[j][ph]
+        steps.append(n2)
+    steps.reverse()
+    k = ph / 2.0
+    anchors = [(ev[0], k)]
+    for t, n2 in zip(ev[1:], steps):
+        k += n2 / 2
+        anchors.append((t, k))
+    return per_beat, anchors
+
+
+def retime_by_beat_tracking(notes, to_sec, time_sig):
+    """Replace every note's 'start'/'end' tick with its position on a beat
+    grid tracked from the real onset times (to_sec turns the current ticks
+    into seconds). Returns None if there's too little to track, else
+    (tempo, tempo_curve, info): the typical tempo, a beat-by-beat tempo
+    curve that plays the new positions back at the original timing, and
+    numbers for the log.
+
+    Barlines: the first strong beat the piece reaches is taken as a
+    downbeat; any notes before it are a pickup, written at the end of an
+    opening bar of rests."""
+    num, den = time_sig
+    bar_beats = num * 4 / den
+    cycle_beats = 1.5 if (den == 8 and num % 3 == 0) else 3 if num == 3 else 2
+    for n in notes:
+        n['_sec'] = (to_sec(n['start']), to_sec(n['end']))
+    per_beat, anchors = track_beat_grid([(n['_sec'][0], n['pitch']) for n in notes], cycle_beats)
+    if len(anchors) < 8:
+        for n in notes:
+            del n['_sec']
+        return None
+    at = [a for a, _ in anchors]
+    ak = [k for _, k in anchors]
+
+    def interp(xs, ys, x):
+        lo, hi = 0, len(xs) - 2
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if xs[mid] <= x:
+                lo = mid
+            else:
+                hi = mid - 1
+        return ys[lo] + (x - xs[lo]) * (ys[lo + 1] - ys[lo]) / (xs[lo + 1] - xs[lo])
+
+    cycle = cycle_beats * per_beat
+    first_k = ak[0]
+    downbeat = -(-(first_k - 0.01) // cycle) * cycle           # first strong beat at or after the first note
+    origin = downbeat if downbeat <= first_k + 0.01 else downbeat - bar_beats * per_beat
+    tick_per_step = TICKS_PER_BEAT / per_beat
+    for n in notes:
+        s, e = n.pop('_sec')
+        n['start'] = max(0, round((interp(at, ak, s) - origin) * tick_per_step))
+        n['end'] = max(n['start'] + 1, round((interp(at, ak, e) - origin) * tick_per_step))
+
+    # tempo per beat, so playback keeps the performance's own pacing
+    last_beat = int((ak[-1] - origin) / per_beat) + 1
+    times = [interp(ak, at, origin + b * per_beat) for b in range(last_beat + 2)]
+    curve, bpms = [], []
+    for b in range(last_beat + 1):
+        bpm = max(20.0, min(300.0, 60.0 / max(1e-3, times[b + 1] - times[b])))
+        bpms.append(bpm)
+        if not curve or abs(bpm - curve[-1][2]) / curve[-1][2] > 0.01:
+            curve.append((b * TICKS_PER_BEAT, mido.bpm2tempo(bpm), bpm))
+    inner = sorted(bpms[1:-1] or bpms)
+    tempo = float(round(inner[len(inner) // 2]))
+    return tempo, [(t, raw) for t, raw, _ in curve], {
+        'beats': last_beat, 'slowest': inner[len(inner) // 20], 'fastest': inner[-1 - len(inner) // 20],
+        'pickup_beats': (downbeat - first_k) / per_beat if downbeat > first_k + 0.01 else 0.0}
+
+
+def resolve_output_paths(output_path, output_format=None):
+    """(midi_path, musicxml_path) for a run; either may be None. With no
+    --format the output file's own extension decides (.musicxml / .xml ->
+    MusicXML only, anything else -> MIDI only). 'both' writes the two side
+    by side under the same name."""
+    stem, ext = os.path.splitext(output_path)
+    is_xml = ext.lower() in ('.musicxml', '.xml')
+    fmt = output_format or ('musicxml' if is_xml else 'midi')
+    midi_path = None if fmt == 'musicxml' else (stem + '.mid' if is_xml else output_path)
+    xml_path = None if fmt == 'midi' else (output_path if is_xml else stem + '.musicxml')
+    return midi_path, xml_path
+
+
 def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
         pedal_mode='ignore', min_note_ticks=None, playback_sustain=True, grid_mode='straight',
         track_selector=None, channel_override=None, duration_style='dotted',
@@ -1576,12 +3128,23 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
         preserve_source_duration=True, melody_preservation=False,
         dynamic_split=False, split_window_bars=8,
         hand_assignment=False, max_hand_span=16, hand_ambiguity_zone=3,
-        tuplet_detection='off'):
+        tuplet_detection='off', trust_tempo_curve=False, tuplet_fit_mode='relative',
+        output_format=None, key=None, ornament_detection='off', max_voices=2, beat_tracking='auto',
+        fast_notes='auto'):
     """Runs the full cleanup pipeline. Shared by --interactive and normal
     CLI-argument mode. tempo, split_pitch, and time_sig may be None, in
     which case they're estimated from the source file."""
     temperature = max(0.0, min(1.0, temperature))
     configure_grid(grid_mode, duration_style)
+    midi_path, xml_path = resolve_output_paths(output_path, output_format)
+    for out_path in (midi_path, xml_path):
+        if out_path and os.path.abspath(out_path) == os.path.abspath(input_path):
+            sys.exit(f"Error: the output file would overwrite the input file ({input_path}). "
+                     f"Give the output a different name.")
+    if xml_path and grid_mode != 'straight':
+        sys.exit("Error: MusicXML output needs --grid straight for now. The triplet grid puts notes on "
+                 "positions that need triplet brackets worked out beat by beat, which isn't written yet. "
+                 "Use --tuplet-detection auto for tuplets in MusicXML, or --format midi with --grid triplet.")
     if grid_mode == 'triplet':
         print("grid=triplet -- quantizing to a grid that natively fits both straight and "
               "triplet-eighth subdivisions, instead of forcing everything onto straight 16ths",
@@ -1667,11 +3230,22 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
     auto_min = min_note_ticks is None
     if auto_min:
         min_note_ticks = max(1, GRID // 4)  # a 64th note -- clearly below any intended value
-    notes, dropped = filter_noise_notes(notes, min_note_ticks)
-    if dropped:
-        print(f"Dropped {dropped} note(s) shorter than {min_note_ticks} ticks "
-              f"({'auto threshold' if auto_min else 'explicit --min-note-ticks'}) "
-              f"as likely transcription noise", file=sys.stderr)
+    def drop_noise(notes):
+        notes, dropped = filter_noise_notes(notes, min_note_ticks)
+        if dropped:
+            print(f"Dropped {dropped} note(s) shorter than {min_note_ticks} ticks "
+                  f"({'auto threshold' if auto_min else 'explicit --min-note-ticks'}) "
+                  f"as likely transcription noise", file=sys.stderr)
+        return notes
+    # If the beats are about to be re-tracked, tick lengths don't mean
+    # anything yet (they sit on the source's untrusted beat map, where a
+    # real 32nd can measure under the noise threshold) -- filter afterwards.
+    raw_curve = read_tempo_curve(mid, tick_scale)
+    will_track = tempo is None and (beat_tracking == 'on' or (
+        beat_tracking == 'auto' and len(raw_curve) > 1 and assess_tempo_curve(raw_curve)[0]
+        and not trust_tempo_curve))
+    if not will_track:
+        notes = drop_noise(notes)
 
     notes, vel_dropped = filter_ghost_velocity_notes(notes, min_velocity)
     if vel_dropped:
@@ -1686,22 +3260,30 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
 
     # Leading-silence rebase: if the first note doesn't start at tick 0,
     # notation software will render that gap as empty leading measures.
-    # This is almost always real silence at the start of the source audio
-    # (an intro, spoken section, etc.) faithfully transcribed, not a bug --
-    # but the score shouldn't render it as blank bars, so shift everything
-    # so the first note starts the piece.
+    # A GENUINE multi-beat gap is almost always real silence at the start
+    # of the source audio (an intro, spoken section, etc.) faithfully
+    # transcribed, not a bug -- but a SUB-BEAT gap is almost always just
+    # the piece not starting exactly on beat 1 (a short rest, a pickup),
+    # which is completely normal notation and must NOT be stripped, or
+    # every downstream barline silently shifts by that amount -- found
+    # via a real piece that opens with an eighth-rest pickup: MuseScore
+    # comparison showed content that should start measure 2 pulled back
+    # into measure 1, entirely from this 0.59-beat rebase, with no
+    # warning printed at all since the print threshold was already 1
+    # beat but the strip itself had no lower bound to match it.
     leading_offset = min((n['start'] for n in notes), default=0)
-    if leading_offset > 0:
+    gap_beats = leading_offset / TICKS_PER_BEAT if leading_offset else 0.0
+    if gap_beats >= 1.0:
         for n in notes:
             n['start'] -= leading_offset
             n['end'] -= leading_offset
-        gap_beats = leading_offset / TICKS_PER_BEAT
-        if gap_beats >= 1.0:
-            print(f"First note begins {gap_beats:.1f} beats ({leading_offset} ticks) into the "
-                  f"source file -- almost always real leading silence in the source audio (e.g. "
-                  f"an intro before playing starts), faithfully transcribed, not a bug. Rebasing "
-                  f"so the output score starts at the first note instead of showing empty leading "
-                  f"measures.", file=sys.stderr)
+        print(f"First note begins {gap_beats:.1f} beats ({leading_offset} ticks) into the "
+              f"source file -- almost always real leading silence in the source audio (e.g. "
+              f"an intro before playing starts), faithfully transcribed, not a bug. Rebasing "
+              f"so the output score starts at the first note instead of showing empty leading "
+              f"measures.", file=sys.stderr)
+    else:
+        leading_offset = 0  # sub-beat gap -- leave it as a real notated rest, don't rebase
 
     if pedal_mode == 'reflect':
         pedal_intervals = read_pedal_intervals(mid)
@@ -1721,6 +3303,7 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
     else:
         print("pedal-mode=ignore -- sustain pedal data not used (default)", file=sys.stderr)
 
+    time_sig_given = time_sig is not None
     if time_sig is None:
         detected_sig, sig_is_generic = detect_source_time_sig(mid)
         if detected_sig is not None and not sig_is_generic:
@@ -1743,34 +3326,68 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
 
     tempo_curve = rebase_tempo_curve(read_tempo_curve(mid, tick_scale), leading_offset)
 
-    if tempo is None:
+    # Beat tracking: when the source's tempo map can't be trusted (or on
+    # request), work the beats out from the real onset times instead of
+    # keeping the map's beat positions.
+    beat_tracked = False
+    curve_untrusted = (len(tempo_curve) > 1 and assess_tempo_curve(tempo_curve)[0] and not trust_tempo_curve)
+    if tempo is None and (beat_tracking == 'on' or (beat_tracking == 'auto' and curve_untrusted)):
+        src_bpm, _ = detect_source_tempo(mid)
+        to_sec = ticks_to_seconds_fn(tempo_curve, mido.bpm2tempo(src_bpm or 120.0))
+        if not time_sig_given and time_sig != DEFAULT_TIME_SIG:
+            print(f"The source's time signature ({time_sig[0]}/{time_sig[1]}) came from the same beat analysis "
+                  f"as its tempo map, which is being set aside -- using {DEFAULT_TIME_SIG[0]}/{DEFAULT_TIME_SIG[1]} "
+                  f"instead. Pass --time-sig if the piece is in something else.", file=sys.stderr)
+            time_sig = DEFAULT_TIME_SIG
+            bar_ticks = bar_ticks_for(time_sig)
+        tracked = retime_by_beat_tracking(notes, to_sec, time_sig)
+        if tracked is None:
+            print("beat-tracking -- too few notes to find a beat from; falling back to the tempo logic below",
+                  file=sys.stderr)
+        else:
+            tempo, tempo_curve, bt = tracked
+            beat_tracked = True
+            pickup = (f", with a {bt['pickup_beats']:g}-beat pickup before the first barline"
+                      if bt['pickup_beats'] else "")
+            why = (f"the source's tempo map looks erratic ({len(read_tempo_curve(mid, tick_scale))} tempo changes, "
+                   f"big jumps within a bar)" if curve_untrusted else "--beat-tracking on")
+            print(f"beat-tracking -- {why}, so the beats were worked out from when the notes were actually "
+                  f"played: {bt['beats']} beats, typically {tempo:.0f} BPM (the playing ranges about "
+                  f"{bt['slowest']:.0f}-{bt['fastest']:.0f})"
+                  f"{pickup}. Notes are placed on that beat grid, and the output "
+                  f"carries a beat-by-beat tempo curve so playback keeps the original pacing. Pass "
+                  f"--beat-tracking off for the old behavior, or --trust-tempo-curve to keep the source's map.",
+                  file=sys.stderr)
+
+    if will_track:
+        notes = drop_noise(notes)
+    if beat_tracked:
+        pass
+    elif tempo is None:
+        use_curve = False
         if len(tempo_curve) > 1:
             bpms = [round(mido.tempo2bpm(t), 1) for _, t in tempo_curve]
-            tempo = bpms[0]
-            print(f"No --tempo given -- source file has {len(tempo_curve)} tempo changes "
-                  f"({min(bpms):.1f}-{max(bpms):.1f} BPM) -- preserving the full tempo curve "
-                  f"in the output instead of flattening to one value", file=sys.stderr)
-        else:
-            tempo_curve = []  # a single event (or none) gains nothing over the flat path below
-            detected, tempo_is_generic = detect_source_tempo(mid)
-            if detected is not None and not tempo_is_generic:
-                tempo = detected
-                print(f"No --tempo given -- using source file tempo: {tempo} BPM", file=sys.stderr)
+            is_erratic, ratio, max_jump = assess_tempo_curve(tempo_curve)
+            if is_erratic and not trust_tempo_curve:
+                print(f"No --tempo given -- source file has {len(tempo_curve)} tempo changes "
+                      f"({min(bpms):.1f}-{max(bpms):.1f} BPM), but the curve looks erratic "
+                      f"({ratio:.1f}x between its slowest and fastest event, up to a {max_jump:.1f} "
+                      f"BPM jump between adjacent events) -- more likely transcription timing jitter "
+                      f"mislabeled as tempo changes than genuine macro tempo direction. Discarding it "
+                      f"and estimating a single representative tempo instead (pass --trust-tempo-curve "
+                      f"to force preserving it as-is, or --tempo to set one manually).", file=sys.stderr)
+                tempo_curve = []
             else:
-                if detected is not None and tempo_is_generic:
-                    print(f"No --tempo given -- source file tempo ({detected} BPM) is byte-identical to the "
-                          f"untouched MIDI spec default, which most transcription tools stamp automatically "
-                          f"without actually measuring it. Falling through to rhythm-based estimation instead.",
-                          file=sys.stderr)
-                ranked = estimate_tempo_candidates(mid, notes)
-                estimated = ranked[0][0] if ranked else None
-                tempo = estimated if estimated is not None else 120.0
-                print(f"No --tempo given and no usable tempo in source file -- "
-                      f"{'estimated from note-onset rhythm' if estimated is not None else 'using neutral default'}: "
-                      f"{tempo} BPM", file=sys.stderr)
-                ambiguity = describe_tempo_ambiguity(ranked) if ranked else None
-                if ambiguity:
-                    print(ambiguity, file=sys.stderr)
+                use_curve = True
+                tempo = bpms[0]
+                note = " (curve looks erratic, but preserving anyway per --trust-tempo-curve)" if is_erratic else ""
+                print(f"No --tempo given -- source file has {len(tempo_curve)} tempo changes "
+                      f"({min(bpms):.1f}-{max(bpms):.1f} BPM) -- preserving the full tempo curve "
+                      f"in the output instead of flattening to one value{note}", file=sys.stderr)
+        if not use_curve:
+            tempo_curve = []  # a single event, none, or a discarded erratic curve -- flat path below
+            tempo, desc = estimate_representative_tempo(mid, notes)
+            print(f"No --tempo given -- {desc}", file=sys.stderr)
     else:
         tempo_curve = []  # explicit --tempo always wins: flat single tempo, no curve
 
@@ -1781,7 +3398,9 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
 
     source_encoding_tempo, _ = detect_source_tempo(mid)
     source_encoding_tempo = source_encoding_tempo or 120.0
-    if source_encoding_tempo != tempo:
+    if beat_tracked:
+        pass    # notes were already placed by real time; nothing to rescale
+    elif source_encoding_tempo != tempo:
         if preserve_source_duration:
             print(f"Rescaling note timing from the source file's tick-encoding tempo "
                   f"({source_encoding_tempo} BPM -- the reference tempo used when the source's ticks "
@@ -1795,12 +3414,34 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
                   f"source's speed (not rescaled to preserve the original real-world duration).",
                   file=sys.stderr)
 
-    tuplet_groups = detect_tuplet_groups(notes) if tuplet_detection == 'auto' else 0
+    tuplet_groups, rejected_tuplet_windows = (
+        detect_tuplet_groups(notes, tuplet_fit_mode) if tuplet_detection == 'auto' else (0, []))
     if tuplet_groups:
+        mode_note = " (--tuplet-fit-tolerance=absolute)" if tuplet_fit_mode == 'absolute' else ""
         print(f"tuplet-detection=auto -- found {tuplet_groups} local tuplet group(s) "
               f"(quintuplet/septuplet/nontuplet/etc.); those onsets are evenly divided "
-              f"directly instead of snapped independently to the --grid {grid_mode} grid",
-              file=sys.stderr)
+              f"directly instead of snapped independently to the --grid {grid_mode} grid"
+              f"{mode_note}", file=sys.stderr)
+
+    subgrid_clusters = detect_subgrid_clusters(notes) if tuplet_detection == 'auto' else 0
+    if subgrid_clusters:
+        print(f"tuplet-detection=auto -- found {subgrid_clusters} sub-grid cluster(s) (2-3 "
+              f"onsets too close together for the --grid {grid_mode} grid to tell apart, e.g. a "
+              f"quick melodic turn/mordent); those are evenly divided within their own grid slot "
+              f"instead of colliding onto the same tick", file=sys.stderr)
+
+    rejected_collisions = (resolve_rejected_tuplet_collisions(notes, rejected_tuplet_windows)
+                            if tuplet_detection == 'auto' else 0)
+    if rejected_collisions:
+        print(f"tuplet-detection=auto -- nudged {rejected_collisions} note(s) that would "
+              f"otherwise have collided onto the same grid tick after their tuplet candidate "
+              f"window was correctly rejected as not a clean tuplet", file=sys.stderr)
+
+    half_placed = place_half_grid_notes(notes) if fast_notes == 'auto' else 0
+    if half_placed:
+        print(f"fast-notes=auto -- {half_placed} note(s) too quick for the 16th grid would have landed on "
+              f"the same tick as their neighbor (merging into a chord, or vanishing if the pitch repeats); "
+              f"written as 32nd notes instead. Pass --fast-notes off for the old behavior.", file=sys.stderr)
 
     resolve_note_durations(notes, temperature, bar_ticks)
     classify_voice_roles(notes)
@@ -1845,6 +3486,22 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
                               melody_preservation=melody_preservation)
     optimize_staff_durations(bass, temperature, bar_ticks, weights, bass_opt_stats,
                               melody_preservation=melody_preservation)
+    if ornament_detection == 'auto':
+        ornaments = detect_ornaments(treble) + detect_ornaments(bass, id_start=1_000_000)
+        if ornaments:
+            kinds = defaultdict(list)
+            for kind, land in ornaments:
+                kinds[kind].append(land['f_start'] // bar_ticks + 1)
+            listing = "; ".join(f"{len(bars)} {kind.replace('-', ' ')}{'s' if len(bars) != 1 else ''} "
+                                f"(measure {', '.join(map(str, bars))})" for kind, bars in sorted(kinds.items()))
+            print(f"ornament-detection=auto -- found {len(ornaments)} ornament figure(s): {listing}. "
+                  f"{'Each is written as one note with its ornament sign in the MusicXML output; ' if xml_path else ''}"
+                  f"MIDI output keeps the literal notes"
+                  f"{'' if xml_path else ' (ornament signs only exist in MusicXML -- use --format musicxml or both to see them)'}.",
+                  file=sys.stderr)
+        else:
+            print("ornament-detection=auto -- no mordents, turns or trills found", file=sys.stderr)
+
     if melody_preservation:
         print(f"melody-preservation=on -- duration optimizer weights biased per event "
               f"by voice role (melody: tie x{MELODY_TIE_MULT} rest x{MELODY_REST_MULT}, "
@@ -1911,8 +3568,48 @@ def run(input_path, output_path, tempo, split_pitch, temperature, time_sig=None,
         print("playback-sustain=off -- MIDI playback will sound exactly as short as the written "
               "notation (may sound choppy for pieces with lots of shortened notes)", file=sys.stderr)
 
-    out.save(output_path)
-    print(f"Saved {output_path}", file=sys.stderr)
+    if midi_path:
+        out.save(midi_path)
+        print(f"Saved {midi_path}", file=sys.stderr)
+
+    if xml_path:
+        if key is None:
+            fifths, mode, runner = estimate_key(notes)
+            close = (f" {key_name(*runner)} fits nearly as well -- pass --key if the signature looks wrong."
+                     if runner else "")
+            print(f"No --key given -- estimated key: {key_name(fifths, mode)}, from which pitches the "
+                  f"piece spends its time on.{close}", file=sys.stderr)
+        else:
+            fifths, mode = key
+            print(f"--key given -- writing in {key_name(fifths, mode)}", file=sys.stderr)
+        spell_staff(treble, fifths, mode)
+        spell_staff(bass, fifths, mode)
+        title = os.path.splitext(os.path.basename(input_path))[0]
+        mx = write_musicxml(xml_path, treble, bass, time_sig, bar_ticks, tempo,
+                            [] if beat_tracked else tempo_curve, fifths, mode,
+                            title=title, max_voices=max_voices, dotted=(duration_style == 'dotted'))
+        print(f"\n===== MusicXML =====", file=sys.stderr)
+        print(f"{mx['measures']} measures, up to {mx['voices']} voice(s) per staff (--max-voices {max_voices})",
+              file=sys.stderr)
+        if mx['trimmed']:
+            print(f"  {mx['trimmed']} note(s) that only just overlap the next one (held over by the fingers or "
+                  f"pedal) are written ending where that next note starts", file=sys.stderr)
+        if mx['shortened'] or mx['merged']:
+            joined = f"; {mx['merged']} note(s) joined a chord starting at the same time" if mx['merged'] else ""
+            print(f"  {mx['shortened']} more note(s) are cut short because they overlap more notes than "
+                  f"{max_voices} voice(s) per staff can show -- raise --max-voices to keep them{joined}",
+                  file=sys.stderr)
+        if mx['trimmed'] or mx['shortened']:
+            print("  (the MIDI output keeps every note's full length)", file=sys.stderr)
+        if mx['tuplets'] or mx['tuplets_flattened']:
+            flat = (f"; {mx['tuplets_flattened']} tuplet group(s) straddle a barline and were written as "
+                    f"plain fast notes instead" if mx['tuplets_flattened'] else "")
+            print(f"  {mx['tuplets']} tuplet bracket(s) written{flat}", file=sys.stderr)
+        if mx['ornaments']:
+            print(f"  {mx['ornaments']} ornament sign(s) written", file=sys.stderr)
+        if mx['dropped']:
+            print(f"  WARNING: {mx['dropped']} note(s) could not be placed and were left out", file=sys.stderr)
+        print(f"Saved {xml_path}", file=sys.stderr)
     save_last_paths(input_path, output_path)
 
 
@@ -2047,33 +3744,80 @@ def interactive_mode():
         default_output = last['last_output']  # same input as last time -- likely re-testing options
     else:
         default_output = base + "_grandstaff.mid"
-    output_path = _prompt("Output MIDI file path", default=default_output)
+    output_path = _prompt("Output file path", default=default_output)
 
-    detected_tempo, tempo_is_generic = detect_source_tempo(mid)
-    if detected_tempo is not None and not tempo_is_generic:
-        print(f"(detected tempo in source file: {detected_tempo} BPM)")
-        tempo_default = detected_tempo
-    else:
-        if detected_tempo is not None and tempo_is_generic:
-            print(f"(source file tempo ({detected_tempo} BPM) is byte-identical to the untouched MIDI "
-                  f"spec default -- most transcription tools stamp this automatically without actually "
-                  f"measuring it, so treating it as unknown)")
-        ranked = estimate_tempo_candidates(mid, notes)
-        rhythm_tempo = ranked[0][0] if ranked else None
-        if rhythm_tempo is not None:
-            print(f"(estimated from note-onset rhythm: {rhythm_tempo} BPM -- this kind of estimate can "
-                  f"land on exactly half or double the real tempo, so double-check it sounds right)")
-            ambiguity = describe_tempo_ambiguity(ranked)
-            if ambiguity:
-                print(f"({ambiguity})")
-            tempo_default = rhythm_tempo
+    print("\nOutput format: 'midi' is the usual grand-staff MIDI file. 'musicxml' writes a")
+    print("MusicXML score instead, which carries every decision made here (staff per hand,")
+    print("note lengths and ties, key signature, tuplet brackets, ornament signs) straight")
+    print("into MuseScore instead of leaving its MIDI import to guess them again. 'both'")
+    print("writes the two side by side.")
+    inferred_format = 'midi' if resolve_output_paths(output_path)[0] else 'musicxml'
+    output_format = _prompt("Output format (midi/musicxml/both)", default=inferred_format,
+                             validate=lambda v: (v in ('midi', 'musicxml', 'both'),
+                                                  "Enter 'midi', 'musicxml', or 'both'."))
+    wants_xml = output_format != 'midi'
+    key, ornament_detection, max_voices = None, 'off', 2   # advanced options below may change these
+
+    tempo_curve_preview = read_tempo_curve(mid, tick_scale)
+    tempo_default = None  # only meaningful for the flat-tempo branches below
+    trust_tempo_curve = False  # only set True if user explicitly preserves an erratic curve anyway
+    if len(tempo_curve_preview) > 1:
+        bpms = [round(mido.tempo2bpm(t), 1) for _, t in tempo_curve_preview]
+        is_erratic, ratio, max_jump = assess_tempo_curve(tempo_curve_preview)
+        print(f"\nSource file has {len(tempo_curve_preview)} tempo changes "
+              f"({min(bpms):.1f}-{max(bpms):.1f} BPM).")
+        if is_erratic:
+            print(f"This curve looks erratic ({ratio:.1f}x between its slowest and fastest event, "
+                  f"up to a {max_jump:.1f} BPM jump between adjacent events) -- more likely "
+                  f"transcription timing jitter mislabeled as tempo changes than genuine macro "
+                  f"tempo direction (verse/chorus rubato, a real accelerando, etc). Its beat "
+                  f"positions can't be trusted either, so the default is to set it aside and work "
+                  f"the beats out from when the notes were actually played.")
         else:
-            print("(not enough onsets to estimate a tempo -- using 120 BPM)")
-            tempo_default = 120.0
-    tempo = _prompt("Tempo (BPM)", default=tempo_default, cast=float)
+            print("Preserve that full tempo curve in the output (recommended), or flatten the whole")
+            print("piece to one tempo? Flattening will make faster/slower passages sound wrong")
+            print("relative to each other, since they'll all play back at the same single speed.")
+        if _prompt_bool("Preserve the full tempo curve?", default=not is_erratic):
+            tempo = None
+            trust_tempo_curve = is_erratic  # explicit override -- tell run() not to re-discard it
+        elif is_erratic and _prompt_bool("Work the beats out from the playing itself (recommended)?", default=True):
+            tempo = None    # run() beat-tracks an untrusted curve when no tempo is given
+        else:
+            if is_erratic:
+                # Curve itself is untrustworthy -- don't derive the flat default from it either.
+                # Same fallback as the no-curve case: source's own tempo if it looks real, else
+                # rhythm-based estimate (not raw rhythm estimation alone, which can land on a
+                # fast subdivision rather than the true beat tempo on dense/ornamental material).
+                tempo_default, _ = estimate_representative_tempo(mid, notes)
+            else:
+                tempo_default = min(bpms)
+            tempo = _prompt("Flat tempo (BPM)", default=tempo_default, cast=float)
+    else:
+        detected_tempo, tempo_is_generic = detect_source_tempo(mid)
+        if detected_tempo is not None and not tempo_is_generic:
+            print(f"(detected tempo in source file: {detected_tempo} BPM)")
+            tempo_default = detected_tempo
+        else:
+            if detected_tempo is not None and tempo_is_generic:
+                print(f"(source file tempo ({detected_tempo} BPM) is byte-identical to the untouched MIDI "
+                      f"spec default -- most transcription tools stamp this automatically without actually "
+                      f"measuring it, so treating it as unknown)")
+            ranked = estimate_tempo_candidates(mid, notes)
+            rhythm_tempo = ranked[0][0] if ranked else None
+            if rhythm_tempo is not None:
+                print(f"(estimated from note-onset rhythm: {rhythm_tempo} BPM -- this kind of estimate can "
+                      f"land on exactly half or double the real tempo, so double-check it sounds right)")
+                ambiguity = describe_tempo_ambiguity(ranked)
+                if ambiguity:
+                    print(f"({ambiguity})")
+                tempo_default = rhythm_tempo
+            else:
+                print("(not enough onsets to estimate a tempo -- using 120 BPM)")
+                tempo_default = 120.0
+        tempo = _prompt("Tempo (BPM)", default=tempo_default, cast=float)
 
     preserve_source_duration = True
-    if tempo != tempo_default:
+    if tempo is not None and tempo != tempo_default:
         print("You entered a tempo different from the detected/estimated one. This can mean two "
               "different things:")
         print("  preserve-duration: ticks get rescaled so the piece's real-world length still "
@@ -2295,12 +4039,61 @@ def interactive_mode():
                                            "split point counts as reconsiderable; 0 disables "
                                            "reassignment)",
                                            default=3, cast=int, validate=valid_nonneg)
+
+        print("\nTuplet detection [experimental]: finds local n-tuplet bursts")
+        print("(quintuplets, septuplets, nontuplets, etc. against a 1- or 2-beat")
+        print("span), plus smaller 2-3 note clusters too close together for the")
+        print("grid to tell apart (e.g. a quick melodic turn/mordent), directly")
+        print("in the source, and snaps just those onsets to exact even division")
+        print("instead of each one rounding independently to the --grid above.")
+        print("Independent of --grid; leaves everything outside a detected group")
+        print("on plain grid quantization.")
+        tuplet_detection = 'auto' if _prompt_bool("Enable tuplet detection?", default=False) else 'off'
+        if tuplet_detection == 'auto':
+            print(f"\nTuplet fit tolerance: 'relative' (recommended) requires a candidate group "
+                  f"to fit within {TUPLET_FIT_TOLERANCE_PCT*100:.0f}% of its own subdivision width -- "
+                  f"a tightly-packed group (small span, high N) is held to a proportionally stricter "
+                  f"standard, so one badly-fitting member's real recorded timing can't get silently "
+                  f"overridden just because the group's average looks fine. 'absolute' uses the older "
+                  f"flat {TUPLET_FIT_TOLERANCE_TICKS}-tick threshold regardless of subdivision width.")
+            tuplet_fit_mode = _prompt("Tuplet fit tolerance (relative/absolute)", default="relative",
+                                       validate=lambda v: (v in ("relative", "absolute"),
+                                                            "Enter 'relative' or 'absolute'."))
+        else:
+            tuplet_fit_mode = 'relative'
+
+        print("\nOrnament detection [experimental]: recognizes mordents, turns and trills")
+        print("(very quick stepwise figures around one note) and writes each as a single")
+        print("note with its ornament sign. Only shows up in MusicXML output; the MIDI")
+        print("file keeps the literal notes either way.")
+        ornament_detection = 'auto' if _prompt_bool("Enable ornament detection?", default=False) else 'off'
+
+        if wants_xml:
+            print("\nKey for the MusicXML score: decides the key signature and how notes are")
+            print("spelled (C# or Db). Leave blank to estimate it from the notes, or type a")
+            print("key like A, F#m, 'Bb minor', or a number of sharps/flats like -3.")
+            while True:
+                raw_key = input("Key [estimate]: ").strip()
+                if not raw_key:
+                    break
+                try:
+                    key = parse_key(raw_key)
+                    break
+                except ValueError as e:
+                    print(f"  {e}")
+            print("\nVoices per staff in the MusicXML score: notes overlapping more deeply")
+            print("than this are written shorter, ending where the next note in their voice")
+            print("starts. 2 suits most piano music; 1 is the plainest read.")
+            max_voices = _prompt("Max voices per staff (1-4)", default=2, cast=int,
+                                  validate=lambda v: (1 <= v <= 4, "Enter a number from 1 to 4."))
     else:
         melody_preservation = False
         dynamic_split = False
         split_window_bars = 8
         hand_assignment = False
         max_hand_span, hand_ambiguity_zone = 16, 3
+        tuplet_detection = 'off'
+        tuplet_fit_mode = 'relative'
 
     print()
     run(input_path, output_path, tempo, split_pitch, temperature, time_sig,
@@ -2309,7 +4102,9 @@ def interactive_mode():
         duration_style, min_velocity, velocity_mode, velocity_scale,
         tie_weight, rest_weight, artic_weight, preserve_source_duration,
         melody_preservation, dynamic_split, split_window_bars,
-        hand_assignment, max_hand_span, hand_ambiguity_zone)
+        hand_assignment, max_hand_span, hand_ambiguity_zone,
+        tuplet_detection, trust_tempo_curve, tuplet_fit_mode,
+        output_format, key, ornament_detection, max_voices)
 
 
 def main():
@@ -2466,11 +4261,57 @@ def main():
                      help='[experimental, default off -- not yet validated against real pieces, '
                           'same status as --melody-preservation/--dynamic-split/--hand-assignment] '
                           '"auto": detect local n-tuplet bursts (quintuplets, septuplets, nontuplets, '
-                          'etc. against a 1- or 2-beat span) directly in the source, independent of '
-                          '--grid, and quantize just those onsets to exact even division instead of '
-                          'snapping each one independently to the outer grid -- fixes uneven durations '
-                          'on genuinely fast ornamental material. "off" (default): use only the '
-                          '--grid straight/triplet grid everywhere.')
+                          'etc. against a 1- or 2-beat span), plus smaller 2-3 note clusters too close '
+                          'together for the outer grid to tell apart (e.g. a quick melodic '
+                          'turn/mordent), directly in the source, independent of --grid, and quantize '
+                          'just those onsets to exact even division instead of snapping each one '
+                          'independently to the outer grid -- fixes uneven durations on genuinely fast '
+                          'ornamental material. "off" (default): use only the --grid straight/triplet '
+                          'grid everywhere.')
+    ap.add_argument('--tuplet-fit-tolerance', choices=['relative', 'absolute'], default='relative',
+                     help=(f'Only relevant with --tuplet-detection auto. "relative" (default): a '
+                           f'candidate n-tuplet group must fit within {TUPLET_FIT_TOLERANCE_PCT * 100:.0f}%% '
+                           f'of its own subdivision width -- a tightly-packed group (small span, high N) '
+                           f'is held to a proportionally stricter standard than a loosely-packed one, so a '
+                           f'single badly-fitting member (real recorded nuance) cannot slip through just '
+                           f'because the group average looks fine. "absolute": the older flat '
+                           f'{TUPLET_FIT_TOLERANCE_TICKS}-tick threshold regardless of subdivision width, '
+                           f'for anyone who wants the more lenient original behavior.'))
+    ap.add_argument('--trust-tempo-curve', action='store_true',
+                     help='When --tempo is omitted and the source has a multi-event tempo curve that '
+                          'looks erratic, the default is to set it aside and find the beats from the '
+                          'real note timing instead (see --beat-tracking). Pass this to keep the '
+                          'source\'s curve and its beat positions exactly as they are.')
+    ap.add_argument('--beat-tracking', choices=['auto', 'on', 'off'], default='auto',
+                     help='Work out where the beats fall from when the notes were actually played, instead '
+                          'of trusting the beat positions in the source file. "auto" (default): do this when '
+                          'the source has a tempo map that looks erratic. "on": always. "off": never (an '
+                          'erratic tempo map is then flattened to one tempo, as before). Ignored when '
+                          '--tempo is given.')
+    ap.add_argument('--fast-notes', choices=['auto', 'off'], default='auto',
+                     help='"auto" (default): two notes that are too quick for the 16th-note grid and would '
+                          'land on the same tick (merging into a chord, or losing a note if the pitch '
+                          'repeats) are written as 32nd notes instead. "off": leave them on the 16th grid.')
+    ap.add_argument('--format', dest='output_format', choices=['midi', 'musicxml', 'both'], default=None,
+                     help='What to write. "midi": the grand-staff MIDI file. "musicxml": a MusicXML score '
+                          'that carries every engraving decision made here straight into notation software '
+                          '(staff per hand, note lengths and ties, key signature and note spelling, tuplet '
+                          'brackets, ornament signs) instead of leaving its MIDI importer to guess them '
+                          'again. "both": the two side by side under the same name. Default: decided by '
+                          'the output file\'s extension -- .musicxml or .xml means MusicXML, anything else '
+                          'MIDI.')
+    ap.add_argument('--key', default=None, metavar='KEY',
+                     help='MusicXML only. Key to write the score in: a name like A, F#m, "Bb minor", or a '
+                          'number of sharps (positive) / flats (negative) like -3. Decides the key signature '
+                          'and how notes are spelled (C# or Db). Default: estimated from the notes.')
+    ap.add_argument('--max-voices', type=int, default=2, choices=[1, 2, 3, 4], metavar='N',
+                     help='MusicXML only. Most independent voices to write per staff (1-4, default 2). '
+                          'Notes overlapping more deeply than this are written shorter, ending where the '
+                          'next note in their voice starts.')
+    ap.add_argument('--ornament-detection', choices=['auto', 'off'], default='off',
+                     help='[experimental, default off] "auto": recognize mordents, turns and trills -- very '
+                          'quick stepwise figures around one note -- and write each as a single note with '
+                          'its ornament sign in MusicXML output. MIDI output is not changed by this.')
     if pre_args.profile:
         ap.set_defaults(**PROFILES[pre_args.profile])
     args = ap.parse_args()
@@ -2499,6 +4340,12 @@ def main():
         ap.error("--max-hand-span must be zero or a positive number of semitones")
     if args.hand_ambiguity_zone < 0:
         ap.error("--hand-ambiguity-zone must be zero or a positive number of semitones")
+    key = None
+    if args.key is not None:
+        try:
+            key = parse_key(args.key)
+        except ValueError as e:
+            ap.error(f"--key: {e}")
 
     run(args.input, args.output, args.tempo, args.split_pitch, args.tie_temperature, time_sig,
         args.pedal_mode, args.min_note_ticks, args.playback_sustain == 'on', args.grid,
@@ -2508,7 +4355,9 @@ def main():
         args.tempo_rescale == 'preserve-duration', args.melody_preservation == 'on',
         args.dynamic_split == 'on', args.split_window_bars,
         args.hand_assignment == 'on', args.max_hand_span, args.hand_ambiguity_zone,
-        args.tuplet_detection)
+        args.tuplet_detection, args.trust_tempo_curve, args.tuplet_fit_tolerance,
+        args.output_format, key, args.ornament_detection, args.max_voices, args.beat_tracking,
+        args.fast_notes)
 
 
 if __name__ == '__main__':

@@ -3,6 +3,462 @@
 All notable changes to ScorePrep are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.8]
+
+- **Attempted fix for lost staccato articulation, tried and reverted this session -- see HANDOFF.md for the open investigation.** Found via a real measure-by-measure comparison (RiverFlowInYou.mid bar 1): the original transcription shows staccato marks when opened directly in MuseScore, at a passage where ScorePrep's output showed none. Traced the actual mechanism (after two wrong theories -- optimizer cost weights at low tie-temperature, then "the source data just doesn't have it"; neither survived checking real numbers): every one of 7 consecutive onsets in that passage has a genuine 5-8 tick gap in the source MIDI, below GRID's 96-tick (16th-note) resolution -- both the note's real end and the next onset's real start round to the *same* grid tick, so quantization erases the gap entirely, before the optimizer or tie-temperature ever get involved. Built `apply_articulation_gaps` (per staff, right before MIDI export) to shorten just the *exported* note-off -- not the notated duration -- for any note with a real, currently-swallowed source gap, restoring a clear enough gap for MuseScore's import to read as staccato.
+  **Reverted after the next measure-by-measure comparison showed it over-firing**: it marked all 5 chord-onsets of an entire fast run as staccato, when the original score only marks one specific note. The "does a real gap exist at all" check can't distinguish "this note is genuinely meant to be detached" from "this is just how a fast run of separately-struck notes gets transcribed" -- both produce the same small-gap signature in the source data. This is a real, unsolved discrimination problem, not a threshold to retune with more confidence. Code fully reverted (`apply_articulation_gaps`, `STACCATO_GAP_MIN_TICKS`, `STACCATO_SHORTEN_FRAC`, `export_end` all removed); confirmed byte-identical output to the pre-attempt baseline. Kept here as a record of what was tried and why it didn't work, so it isn't re-attempted the same way.
+
+### Fixed
+
+- **Leading-silence rebase silently stripped genuine short rests at the
+  start of a piece, shifting every downstream barline.** Found via the
+  first real measure-by-measure comparison against the actual notated
+  score (River Flows In You, MuseScore render vs. original sheet music):
+  content that should start measure 2 (a quintuplet run) was pulled back
+  into measure 1 in ScorePrep's output. Root cause: the source's first
+  note begins 0.59 beats in (a real eighth-rest pickup, clearly notated
+  in the original score) -- but the leading-silence rebase (meant to
+  strip real transcription dead-air before a performance starts, e.g. a
+  multi-second intro) stripped this too, snapping the first note to tick
+  0 and shifting the entire piece earlier by that amount, silently: the
+  print threshold for this rebase was already 1 beat, but the rebase
+  ITSELF had no matching lower bound, so anything under 1 beat got
+  stripped with zero warning. Fixed by giving the strip the same 1-beat
+  floor the message already implicitly judged as the right cutoff: a
+  sub-beat gap is now left alone entirely (real notated rest, not
+  transcription noise), while genuine multi-beat gaps still rebase
+  exactly as before. Verified: RiverFlowInYou.mid (0.59 beats) no longer
+  rebases at all; kalank.mid (1.0 beat, boundary case) and Sukoon (6.0
+  beats, clearly a real intro) are unaffected, rebasing exactly as
+  before. This is a distinct, previously-unknown bug from the tempo
+  curve and sub-grid-cluster fixes already shipped -- a one-time
+  constant offset misaligning every barline throughout the piece, not a
+  speed/tempo issue at all, though it very plausibly compounded the
+  overall "something's off" perception those fixes were chasing.
+
+### Added
+
+- **Sub-grid cluster detection (`--tuplet-detection auto`, same flag as
+  before -- now catches a second, smaller failure mode).** Investigated
+  the "successive notes collapsing into one" symptom directly: 13 of 14
+  flagged spots on RiverFlowInYou.mid were genuine same-hand collisions
+  (the 14th was a melody note and an unrelated bass note sharing a tick
+  coincidentally -- not a real problem, since they land on different
+  staves anyway). All 13 turned out to be real, consistently-recurring
+  melodic ornaments (stepwise turns/mordents, e.g. a whole-step-up-and-
+  back figure), not incidental fast passagework or classic zero-duration
+  grace notes -- durations were short-but-real (22-57 ticks) and the
+  same figure recurs throughout the piece. New `detect_subgrid_clusters`
+  runs the same detect-before-quantize-and-protect mechanism as
+  `detect_tuplet_groups` (after it, skipping anything already
+  tuplet-tagged), but with a completely different, narrower trigger:
+  N=2-3 onsets that the outer grid would actually collide onto the same
+  tick, spread evenly across that one grid slot instead. N=2/3 is
+  exactly what `detect_tuplet_groups` deliberately excludes (unsafe at
+  full-beat scale, where almost any ordinary rhythm trivially has 2-3
+  onsets per beat) -- safe here only because the trigger is the actual
+  collision itself, not the onset count, which normal-speed material
+  never produces regardless of N. Needs one guard the beat-scale search
+  doesn't: hands aren't split yet at this point in the pipeline, so a
+  new `SUBGRID_MAX_PITCH_GAP` (12 semitones) keeps a coincidental
+  melody/bass overlap (the 14th spot above, 33 semitones apart) from
+  being treated as one figure.
+  **False-positive investigation before shipping this:** first attempt
+  (pitch+time gating alone) found 0/109/186 "clusters" on kalank/
+  Sukoon/RiverFlowInYou -- wildly implausible, since Sukoon and kalank
+  showed no evidence of this problem during the original investigation.
+  Inspected them directly: they were ordinary long-held chords with a
+  few ticks of natural strike jitter between notes (durations in the
+  hundreds/thousands of ticks), sneaking through because the pitch gate
+  only checks ADJACENT pairs in a chain -- a whole chord can pass as a
+  "connected" chain even when its full span is wide, if each
+  consecutive step happens to be small enough. Added
+  `SUBGRID_MAX_NOTE_DURATION_FACTOR` (1x GRID): only notes shorter than
+  one grid unit are eligible at all, which real ornaments always are and
+  held chords never are. Re-verified after the fix: kalank 0, Sukoon 2
+  (manually inspected -- both genuine short turns), RiverFlowInYou 11-13
+  depending on how early noise-filtering interacts with one very short
+  member. Also caught and fixed a related bug in the clustering itself
+  during this work: the time/pitch chain could greedily extend to a 3rd
+  onset that broke the actual collision (e.g. two ticks colliding, a
+  third landing in the next grid slot over), losing the valid 2-onset
+  match entirely -- fixed by trying successively smaller sub-clusters
+  before giving up on a chain instead of only ever checking the full
+  chained length.
+  **One known residual case, deliberately not chased further:** a
+  longer "landing" note (137 ticks -- past the ornament, back to a
+  normal note) can still coincidentally collide with an already-fixed
+  cluster's anchor tick. Checked whether loosening the duration cutoff
+  to also catch it (e.g. 2x GRID) was safe: no -- some of the
+  chord-jitter false positives found above have durations as low as
+  4-5 ticks, so duration alone isn't a clean separator at any threshold,
+  and loosening it risks reopening exactly the false-positive door just
+  closed. Left as a known gap rather than adding more heuristics on
+  weaker evidence.
+  `--tuplet-detection off` unaffected by construction -- verified
+  byte-identical output across runs, no new messaging.
+
+- **Rejected tuplet-candidate windows can still leave a real quantize
+  collision behind -- now repaired instead of left alone (same
+  `--tuplet-detection auto` flag).** `detect_subgrid_clusters` (above)
+  deliberately excludes any note >= one grid unit long, correctly -- a
+  long-held note isn't an ornament -- but that leaves exactly one case
+  unresolved: a genuinely long, correctly-excluded held note colliding
+  with unrelated material once a candidate tuplet window containing it
+  gets (correctly) rejected as not actually a tuplet. Found on
+  RiverFlowInYou.mid tick ~6114: loosening the fit-tolerance threshold
+  enough to accept that window would also re-accept a genuinely bad
+  group elsewhere (see the `--tuplet-fit-tolerance` entry below) -- the
+  threshold itself can't fix this, so `detect_tuplet_groups` now also
+  reports which windows it rejected, and a new
+  `resolve_rejected_tuplet_collisions` pass checks each one for a real
+  same-tick collision under plain quantization and nudges just the
+  colliding note(s) forward to the next free grid tick, preserving their
+  real recorded duration.
+  **False-positive investigation before shipping this (same discipline
+  as the sub-grid work above):** the naive version -- repair any real
+  collision inside any rejected window -- nudged 626 notes on kalank and
+  182 on Sukoon, both supposed to be clean control files. Traced to two
+  distinct causes, fixed in order: (1) "rejected window" was being
+  recorded once per onset inside a burst rather than once per burst,
+  so heavily overlapping windows re-processed and compounded the same
+  notes' shifts repeatedly -- fixed by deduplicating recorded windows
+  against onsets already claimed by an earlier one (separate bookkeeping
+  from `detect_tuplet_groups`' own accept/reject `used` set, so a
+  smaller valid tuplet nested inside a rejected span can still be found
+  exactly as before). (2) even a single pass per burst was still wrong:
+  most of the "collisions" turned out to be an ordinary bass note and a
+  melody/chord note struck together across hands (e.g. pitch 46 vs 65,
+  ~19 semitones apart, or two ~1000-tick sustained notes an octave
+  apart) landing on the same tick *on purpose* -- nudging those apart
+  would have actively damaged the output, not fixed it. Added two gates
+  before a collision is treated as repairable: the pair's pitches must
+  be within `SUBGRID_MAX_PITCH_GAP` (reusing the same constant and
+  reasoning as sub-grid clustering -- close register signals the same
+  melodic line, not an intentional cross-hand simultaneity), AND at
+  least one of the pair must be shorter than
+  `SUBGRID_MAX_NOTE_DURATION_FACTOR` x GRID (this feature's actual
+  target is specifically a long note colliding with something short and
+  fast -- two long notes colliding is ordinary, not the case being
+  fixed). A near-miss window is also now bounded to failing by no more
+  than `NEAR_MISS_TOLERANCE_MULT` (2x) the accept threshold, so an
+  ordinary passage that coincidentally has a tuplet-candidate onset
+  count (common with an extra passing/ornament note) isn't treated as
+  tuplet-adjacent at all. After all of the above: kalank and Sukoon both
+  verified at 0 nudges (byte-identical to `--tuplet-detection off`
+  output) across a 0.10/0.15/0.20 tie-temperature spot-check;
+  RiverFlowInYou lands at 18, all manually spot-checked as short (17-70
+  tick), small-pitch-gap-from-neighbor collisions consistent with real
+  fast passagework, not chord jitter.
+  **Calibrated on one real case, same caveat as the rest of this
+  investigation:** `NEAR_MISS_TOLERANCE_MULT` and the two gates above
+  are tuned against RiverFlowInYou's tick-6114 case and the kalank/Sukoon
+  false positives it produced -- no second real "long note collides
+  after rejection" example exists yet to confirm they generalize.
+
+- **Erratic tempo curves are now discarded and replaced automatically,
+  not just flagged.** A multi-event tempo curve is judged "erratic" if
+  it swings more than 2x between its slowest and fastest event, or
+  jumps more than 20 BPM between adjacent events -- the same signal
+  found directly on a real problem file (RiverFlowInYou.mid: 3.1x
+  slowest-to-fastest, up to a 39 BPM jump within a single beat). That
+  level of volatility reads as transcription timing jitter mislabeled as
+  tempo changes, not genuine macro tempo direction -- passing it through
+  literally means the output genuinely speeds up and slows down by tens
+  of BPM within a beat, which is indistinguishable from the "sounds
+  accelerated/decelerated in different places" symptom on file for this
+  piece. Both `--tempo`-omitted CLI runs and the interactive wizard now
+  *default to discarding an erratic curve and estimating a single
+  representative tempo instead* -- the same estimation already used
+  when there's no curve at all (source file's own tempo if it looks
+  genuinely measured, else rhythm-based estimation from note-onset
+  spacing), factored into one shared `estimate_representative_tempo()`
+  helper so every fallback path agrees. New `--trust-tempo-curve` CLI
+  flag (interactive: just answer the existing preserve-anyway prompt)
+  forces literal preservation for anyone who genuinely wants it despite
+  the warning. Verified all four paths end-to-end: CLI auto-discard
+  lands on the file's own sensible 40.5 BPM (not a raw rhythm-estimate
+  artifact, which landed on an implausible 200 BPM before this fix was
+  wired through the shared helper); `--trust-tempo-curve` still forces
+  literal preservation; explicit `--tempo` is untouched; non-erratic and
+  no-curve pieces (kalank) are unaffected. Calibrated against exactly
+  one real erratic-curve example -- no second case exists yet to confirm
+  the thresholds generalize; revisit if a genuinely rubato piece ever
+  gets mis-flagged.
+
+### Fixed
+
+- **Interactive mode silently flattened every real tempo curve to one flat
+  BPM value, even on pieces with genuine tempo changes throughout.** The
+  CLI-flag path already preserves a source's full tempo curve whenever
+  `--tempo` is left unset -- but the interactive wizard's tempo question
+  always produced a concrete float (even just accepting the shown
+  default counts as "typing a tempo"), which `run()` correctly treats
+  the same as an explicit `--tempo`: flatten to one value, discard the
+  curve entirely. On a piece with real expressive tempo variation (e.g.
+  RiverFlowInYou.mid's 54 genuine tempo changes, 25.2-76.9 BPM), this
+  meant every wizard run forced the whole piece to a single speed,
+  regardless of what the user answered -- which reads exactly like
+  "accelerated in some places, slow in others" once played back at one
+  fixed tempo against music that was never actually constant. This was
+  the real cause of that symptom, not the tuplet-detection or hand-note
+  issues investigated first. Fixed: the wizard now checks for a genuine
+  multi-event tempo curve up front (same generic-default filtering as
+  the CLI path) and, if found, asks whether to preserve it (default:
+  yes) before ever asking for a flat BPM value -- matching what
+  omitting `--tempo` already does on the CLI. Verified on
+  RiverFlowInYou.mid: choosing to preserve correctly reaches the
+  existing "source file has 54 tempo changes... preserving the full
+  tempo curve" path; choosing to flatten still works and reaches the
+  existing tempo-rescale-intent question as before. Pieces with no
+  genuine curve (e.g. kalank.mid) never see the new prompt at all.
+  CLI-flag path (`--tempo` omitted or given) is untouched -- this only
+  changes how the wizard *decides* what value to hand `run()`.
+
+- **Interactive mode never asked about `--tuplet-detection`.** The flag
+  shipped correctly on the CLI-argument path, but the `--interactive`
+  wizard's advanced-options section only prompted for melody
+  preservation/dynamic split/hand assignment -- tuplet detection was
+  simply missing, so anyone using the wizard had no way to turn it on
+  short of editing the command by hand. Added the prompt alongside the
+  other experimental features (advanced options, default off, same
+  framing as the others). Verified via a full interactive-mode run that
+  it now fires correctly (37 groups on RiverFlowInYou, matching the
+  CLI-flag path).
+
+- **`--tuplet-detection auto` could pick a tight partial match over a
+  looser-but-valid full one.** At a given burst, the detector checks
+  every candidate group size against every span, but was keeping
+  whichever candidate had the *lowest average timing error* -- so a
+  tight-fitting subset (e.g. 5 of a real 9-onset run) could beat out the
+  full 9-onset match if its error happened to be smaller, stranding the
+  remaining onsets outside any group to fall back to plain grid-snapping
+  (audible as leftover uneven/colliding notes even with detection on).
+  Now prefers whichever passing candidate covers the most onsets first,
+  using average error only to break ties between equally-sized matches.
+  Verified on the original 9-onset burst: now resolves as one clean
+  nonuplet (9 of 9 evenly divided) instead of quintuplet-then-4-leftover.
+  Group counts on the three benchmark pieces stay well-separated after
+  the change (37/7/0 vs. the prior 38/7/0), confirming it isn't just
+  finding more groups indiscriminately. `off` is unaffected by
+  construction -- the fixed selection logic only runs inside
+  `detect_tuplet_groups`, which `off` never calls.
+
+- **`--dynamic-split` + `--hand-assignment`, used together, could fragment
+  a single melodic line into treble-rest + isolated-bass-blip +
+  treble-resumes.** Found via a real bar-by-bar comparison (RiverFlowInYou
+  bar 7, original vs. ScorePrep output) -- P confirmed the difference was
+  audible, not just cosmetic. Root cause: `--dynamic-split` can locally
+  shift the treble/bass boundary enough to pull a note that's genuinely
+  part of one continuous phrase into `--hand-assignment`'s "ambiguous,
+  reconsider me" zone; the reassignment logic only looks one onset back
+  by pitch centroid, so a brief melodic dip toward the other hand's
+  recent register gets mistaken for a hand crossing and pulled onto the
+  wrong staff, breaking the phrase. Only occurs with BOTH flags enabled
+  together -- neither alone, nor the default pipeline, is affected.
+  Fixed by adding one more condition to `assign_hands`: a note with no
+  simultaneous chord-mate is only reassignment-eligible if at least one
+  neighboring onset genuinely belongs to the other hand -- this catches
+  the "solo passing tone" case without touching genuine hand crossings.
+  A first version of this fix (guarding on ANY note, not just solo ones)
+  was tried and reverted after it was found to break a legitimate
+  octave-doubling chord in kalank.mid (forced a full-octave stretch into
+  one hand); restricting the guard to solo (chord-mate-free) notes fixed
+  the reported bug while leaving simultaneous-chord voicing decisions
+  alone. Verified: RiverFlowInYou bar 7 no longer fragments; kalank's
+  octave-doubling case preserved; default pipeline (both flags off)
+  confirmed byte-identical on all three test files.
+
+- **Rhythm-based tempo estimation was wrong on any source that isn't 384
+  ticks-per-beat.** Note positions are rescaled to the internal 384 grid
+  on load, but the estimator still converted them to seconds using the
+  source's own resolution, counting the rescale twice. An eighth-note
+  run written at 120 BPM was estimated at 75 BPM from a 480-PPQ file and
+  150 BPM from a 960-PPQ one, so the score was notated against the wrong
+  beat. Only affects files with no trustworthy tempo of their own (none,
+  or the generic 120 BPM stamp) -- the three test files are byte-identical
+  across tie-temperatures and flag combinations.
+
+- **A genuine tempo change no longer gets thrown away as "erratic".** The
+  jitter check flagged any curve with a jump over 20 BPM, so a single
+  deliberate section change (e.g. 140 -> 80 BPM thirty bars in) was
+  discarded and the rest of the piece played at the opening tempo. Jitter
+  is dense, a real tempo change isn't: a big jump now only counts when its
+  two tempo events are less than a bar apart, and the slowest/fastest
+  ratio test only applies to a dense curve. RiverFlowInYou (big jumps 1-2
+  beats apart, about one event per bar) is still flagged exactly as
+  before. Same caveat as the original thresholds: one real positive case,
+  plus one synthetic negative.
+
+- **Interactive mode crashed right before converting whenever advanced
+  options were skipped** (the default answer) -- `--tuplet-fit-tolerance`'s
+  setting was only filled in on the advanced-options path. Fixed;
+  interactive runs complete again.
+
+- **reduce_test.py: tempo changes and time signature now survive the
+  reduction.** Only the first tempo event was kept and the time signature
+  was dropped, so a piece with a slower middle section played that
+  section at the opening tempo. All tempo events and the source time
+  signature are now written to the output. On a synthetic 4-instrument
+  test with one 140 -> 80 BPM change, the full reduce_test -> ScorePrep
+  chain went from 228.5 s to 361.7 s (source: 362.1 s).
+
+- **reduce_test.py: notes overlapping on the same pitch were being
+  destroyed downstream.** Two instruments in unison, or a note re-struck
+  while still sounding, were written as overlapping notes on one track.
+  MIDI can't represent that: ScorePrep read the later note as ending at
+  the earlier note's release, cutting it to a few ticks, and then dropped
+  it as noise. Through the full chain, kalank.mid lost 147 notes this way
+  (now 9, all genuine short notes). Unisons are now merged into one key and
+  an overlapping note is cut where the next one starts, so the
+  output-notes count reduce_test reports is exactly what ScorePrep
+  receives.
+
+- **reduce_test.py: a pitch re-struck before its note-off was silently
+  dropped on load.** The earlier note is now closed at the re-strike, the
+  same way ScorePrep reads it. Notes are also now tracked per channel, so
+  two instruments on different channels of one track no longer interfere.
+
+- **reduce_test.py: chord size now counts piano keys, not source notes.**
+  A pitch doubled by two instruments used two of `--max-chord-size`'s
+  slots for one key, leaving a real pitch out of the chord. The
+  "Average/Maximum chord size" stats count keys too.
+
+- **MusicXML export (`--format musicxml` or `both`, or an output file
+  ending in `.musicxml`).** Until now ScorePrep could only hand MuseScore
+  a MIDI file, and MuseScore's importer re-derived staves, ties, rests and
+  note names by itself -- sometimes undoing choices made here. The
+  MusicXML file states them outright: staff per hand, every note's written
+  length and ties exactly as the optimizer chose (same noteheads, same tie
+  count), tuplet brackets from `--tuplet-detection`, tempo, time signature.
+  New pieces this needed:
+  - *Key and note spelling.* The key is estimated from the notes (`--key`
+    overrides) and each note spelled for it; a note outside the key is
+    spelled by whether the line moves on a half step up (sharp) or down
+    (flat). Tested on 50 engraved scores from the music21 corpus: key
+    signature right in 47, 98.9% of 28,274 notes spelled as printed.
+    RiverFlowInYou comes out in A major.
+  - *Voices.* Overlapping notes in one hand need separate voices on
+    paper, and pedaled playing overlaps up to 9 deep in the test files.
+    `--max-voices` (default 2) caps it; a note that overlaps too deeply,
+    or only just overlaps the next one, is written ending where the next
+    starts. The report counts these (RiverFlowInYou 96, kalank 427 at the
+    defaults). MIDI output is untouched.
+  Checked on all three test files across 8 flag combinations: every file
+  passes the official MusicXML schema, opens in MuseScore, and -- read
+  back by a separate reader -- contains exactly the MIDI output's notes
+  apart from the shortened ones counted above. MuseScore's own playback of
+  the file matches note for note. Not supported yet: `--grid triplet`
+  (refused with a message), key changes mid-piece, beams, playback pedal.
+  A tuplet group that straddles a barline can't take a bracket and is
+  written as plain fast notes. MIDI output with default settings is
+  byte-identical to before.
+
+- **Ornament detection (`--ornament-detection auto`, default off,
+  experimental).** Mordents, turns and trills are recognized as figures
+  and written as one note with its ornament sign in MusicXML, with an
+  accidental on the sign when the neighbor note is outside the key. A
+  figure is a run of single notes each less than a 32nd apart, moving by
+  step around one pitch. That speed limit comes from RiverFlowInYou,
+  where real ornaments sit at 24-47 ticks between notes and ordinary
+  16th runs of the same shape at 90-95. Result there: 14 mordents found,
+  all "note, step up, back"; kalank and Sukoon (controls): none. Turns,
+  trills and lower mordents are verified only on constructed examples so
+  far. MIDI output is not changed by this flag.
+
+- **Beat tracking: a file with an erratic tempo map is no longer
+  flattened to one tempo -- its beats are found from the real note
+  timing.** This is the cause of RiverFlowInYou coming out slow and
+  off the beat from bar 7 on. The file is a live, rubato performance (57-76
+  BPM, phrase endings slowing to about 40), and its tempo map is the
+  transcriber's own beat tracking. The earlier "erratic curve" fix threw
+  that map away and stamped the first tempo (40.5 BPM) on the whole piece,
+  while keeping the map's beat positions: the output played back at 313
+  seconds instead of 214, and the barlines (2/4, with beats missing at
+  held notes) drifted away from the phrases. Now, when a map is judged
+  erratic, every note is taken back to its real time in seconds and
+  ScorePrep finds the beats itself: each gap between notes is read as some
+  number of 16ths at a slowly varying tempo, preferring notes on beats and
+  bass notes on strong beats. The output carries a beat-by-beat tempo
+  curve, so playback keeps the performance's pacing (216 s).
+  Checked note by note against the published score: 96% of its on-beat
+  notes land on a beat (source's map: 91%) and 98% of its downbeats on a
+  barline (was 54%, counting the old 2/4 bars generously); the half-beat
+  pickup and 4/4 bars match the score. The source's time signature is set
+  aside with its map (4/4 assumed unless `--time-sig` is given).
+  New flag `--beat-tracking auto|on|off`; `--trust-tempo-curve` still
+  keeps the source's map. Limits: tuned on this one piece. On the
+  published score played back with artificial rubato it is exact for
+  steady or lightly flexible tempo, 74% right-place-in-bar at +-10% with
+  phrase-end slowing, and under 50% for heavier artificial swings. With
+  `on` on files that have no tempo map it can settle on half tempo. An
+  explicit `--tempo` skips it. kalank and Sukoon are byte-identical.
+
+- **The "quintuplets" in RiverFlowInYou were an artifact of that tempo
+  map.** With beats tracked, `--tuplet-detection auto` finds no
+  quintuplet groups in the piece at all (14 sub-grid ornaments remain);
+  the opening is plain 16ths and 8ths, as in the published score. The
+  earlier fit-tolerance tension at tick ~6114 no longer arises on this
+  file.
+
+- **MusicXML: the report now separates notes ended at the next note
+  (slight overlaps, any voice limit) from notes cut by `--max-voices`.**
+  Measured against the published score, raising the limit from 2 to 4 on
+  RiverFlowInYou changes 2 notes and no agreement figure; on kalank it
+  keeps 155 more notes whole for about 8% more rests.
+
+- **Fast notes no longer merge or vanish (`--fast-notes auto`, the new
+  default).** On a 16th-note grid, a 32nd-note figure rounds two notes
+  onto one tick: different pitches came out as a chord, and a repeated
+  pitch lost a note. Each colliding pair is now looked at on a grid twice
+  as fine and each note written where it rounds to there, as 32nds; three
+  quick notes inside one 16th become a triplet of 32nds. Guards against
+  splitting ordinary chords: the onsets must be at least a 64th apart and
+  within an octave, and either one note is shorter than a 16th or the two
+  are a step apart (a rolled chord is never a second). Checked against
+  the input in real time: RiverFlowInYou had 30 places where notes played
+  60+ ms apart were written on the same tick; now 1, and no note sits
+  more than 100 ms from where it was played. kalank: 18 notes placed
+  (8 rolled-chord-like pairs a third or more apart stay together);
+  Sukoon: none. `--fast-notes off` restores the old behavior.
+
+- **A note re-struck slightly before its previous note-off was read with
+  a length of a few milliseconds and dropped as noise.** Transcriptions
+  of legato repeated notes overlap them like this. Note-offs are now
+  paired with the oldest open note of their pitch, and a note still
+  sounding at its pitch's next onset ends there. RiverFlowInYou got 4
+  notes back -- each the first note of a quick figure on a repeated A.
+  When beat tracking runs, the noise filter is also applied after it
+  rather than before, since note lengths on the source's untrusted beat
+  map don't mean anything.
+
+- **A long-held note is no longer cut to the length of a short note
+  struck with it.** Notes starting together share the shortest member's
+  written length so chords don't fracture -- but that wrote a melody note
+  held four beats as a 16th and a bar of rests whenever a passing note
+  coincided with it. A note held at least four times longer than its
+  chord-mate, and at least a beat longer, now keeps its own length. In
+  RiverFlowInYou this restores the held D that ends the opening phrase
+  (score: 3.3 beats; was 0.25, now 3.5 at `--tie-temperature 0.15`). At
+  the default 0.0 that note is still cut at the barline, since 0.0 never
+  ties across one. This changes the control files slightly: 12-27 notes
+  of ~1,300-1,400 in kalank and Sukoon are now written longer.
+
+- **`--format both` could overwrite the input file** when the output was
+  given as `<input name>.musicxml` (the MIDI went to `<input name>.mid`).
+  Now refused with a message.
+
+- **What the bar-by-bar comparison with the published score shows after
+  all of the above** (RiverFlowInYou, defaults): 95% of the score's
+  on-beat notes on a beat, 98% of its downbeats on a barline, 92% of
+  note-to-note rhythms identical, hands 93% (97% with `--dynamic-split on
+  --hand-assignment on`). Most of what still differs is the performance
+  itself, not the conversion: about 180 of the score's 1,118 notes aren't
+  in the transcription (one 12-bar stretch isn't played at all, another
+  is played as block chords), the performer holds the opening fermata a
+  bar longer, and some repeated-note figures are played with one note
+  fewer than written.
+
 ## [1.2.7]
 
 ### Fixed

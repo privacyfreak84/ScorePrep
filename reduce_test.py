@@ -31,30 +31,49 @@ def load_notes(path):
         raise ReduceTestError(f"Couldn't read '{path}' as a MIDI file: {e}")
 
     ppq = mid.ticks_per_beat
-    tempo = None  # microseconds per beat, first set_tempo found in the file
+    # Every set_tempo event in the file, {abs_tick: microsec_per_beat}.
+    # Orchestral/DAW exports often carry real tempo changes (a slower middle
+    # section, a final ritardando); keeping only the first one would make
+    # the whole reduction play at the opening tempo.
+    tempo_map = {}
+    time_sig = None  # first time_signature message found, passed through as-is
     notes = []  # (start_tick, end_tick, pitch, velocity, track_idx, track_name)
     for ti, track in enumerate(mid.tracks):
         name = ""
         abs_t = 0
-        active = {}  # pitch -> (start_tick, velocity)
+        # keyed by (channel, pitch): one track can carry several channels,
+        # i.e. several instruments, playing the same pitch independently
+        active = {}  # (channel, pitch) -> (start_tick, velocity)
         for msg in track:
             abs_t += msg.time
             if msg.type == "track_name":
                 name = msg.name
-            elif msg.type == "set_tempo" and tempo is None:
-                tempo = msg.tempo
+            elif msg.type == "set_tempo":
+                tempo_map[abs_t] = msg.tempo
+            elif msg.type == "time_signature" and time_sig is None:
+                time_sig = msg.copy(time=0)
             elif msg.type == "note_on" and msg.velocity > 0:
-                if getattr(msg, "channel", None) == 9:
+                if msg.channel == 9:
                     continue  # drum channel: not pitched, exclude from reduction
-                active[msg.note] = (abs_t, msg.velocity)
+                key = (msg.channel, msg.note)
+                if key in active:
+                    # Same pitch struck again before its note_off arrived --
+                    # common in orchestral MIDI. The earlier note really did
+                    # sound up to this point, so close it here instead of
+                    # silently discarding it.
+                    st, vel = active.pop(key)
+                    if abs_t > st:
+                        notes.append([st, abs_t, msg.note, vel, ti, name])
+                active[key] = (abs_t, msg.velocity)
             elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
-                if msg.note in active:
-                    st, vel = active.pop(msg.note)
+                key = (msg.channel, msg.note)
+                if key in active:
+                    st, vel = active.pop(key)
                     notes.append([st, abs_t, msg.note, vel, ti, name])
-        for pitch, (st, vel) in active.items():
+        for (_ch, pitch), (st, vel) in active.items():
             notes.append([st, abs_t, pitch, vel, ti, name])
     notes.sort(key=lambda n: (n[0], -n[2]))
-    return notes, ppq, tempo
+    return notes, ppq, sorted(tempo_map.items()), time_sig
 
 
 def cluster_slices(notes, tolerance_ticks):
@@ -263,7 +282,12 @@ def thin_slice(slice_notes, max_chord_size, track_priority, melody_track, bass_t
             rest = [n for n in slice_notes if n is not melody]
             bass = min(rest, key=lambda n: n[2]) if rest else None
 
-    if len(slice_notes) <= max_chord_size:
+    # Chord size is counted in piano keys (distinct pitches), not source
+    # notes: two instruments doubling the same pitch are one key on the
+    # piano, and merge_same_pitch_overlaps collapses them before writing.
+    # Counting them twice used to spend two of max_chord_size's slots on one
+    # key, leaving a real extra pitch out of the chord for no reason.
+    if len({n[2] for n in slice_notes}) <= max_chord_size:
         return sorted(slice_notes, key=lambda n: n[2])
 
     if stats is not None:
@@ -292,7 +316,10 @@ def thin_slice(slice_notes, max_chord_size, track_priority, melody_track, bass_t
         if len(kept) >= max_chord_size:
             break
         n = remaining[i]
+        if n[2] in kept_pitches:
+            continue  # a doubling of a pitch already kept -- same key, no slot used
         kept.append(n)
+        kept_pitches.add(n[2])
         if stats is not None:
             explicit_match = track_priority and ranks[i] < len(track_priority)
             if explicit_match and rank_counts[ranks[i]] == 1:
@@ -346,13 +373,55 @@ def collapse_repeats(slices, gap_ticks):
     return out
 
 
-def write_midi(notes, ppq, out_path, target_ppq=None, tempo=None):
+def merge_same_pitch_overlaps(notes, tolerance_ticks):
+    """A piano has one key per pitch, so the reduced part can't sound the
+    same pitch twice at once. Two cases get resolved here, right before
+    writing:
+
+    - Unison: two notes of the same pitch starting within tolerance_ticks
+      of each other (usually two instruments doubling a line). Merged into
+      one note: earliest start, latest end, loudest velocity, attributed to
+      whichever source note was longer.
+    - Overlap: a later note of the same pitch starts while an earlier one
+      is still sounding. The earlier note is cut off where the later one
+      starts (the key is re-struck).
+
+    Before this, both notes were written as overlapping note_ons on one
+    track. ScorePrep reads that the same way (merging or cutting them), so
+    the output note count reduce_test reported was higher than what
+    ScorePrep actually received. Returns (notes, unisons_merged,
+    overlaps_trimmed)."""
+    by_pitch = {}
+    for n in notes:
+        by_pitch.setdefault(n[2], []).append(list(n))
+    out, unisons, trimmed = [], 0, 0
+    for pitch, pnotes in by_pitch.items():
+        pnotes.sort(key=lambda n: (n[0], -(n[1] - n[0])))
+        cur = pnotes[0]
+        for n in pnotes[1:]:
+            if n[0] - cur[0] <= tolerance_ticks:
+                longer = cur if (cur[1] - cur[0]) >= (n[1] - n[0]) else n
+                cur = [min(cur[0], n[0]), max(cur[1], n[1]), pitch,
+                       max(cur[3], n[3]), longer[4], longer[5]]
+                unisons += 1
+                continue
+            if n[0] < cur[1]:
+                cur[1] = n[0]
+                trimmed += 1
+            out.append(cur)
+            cur = n
+        out.append(cur)
+    out.sort(key=lambda n: (n[0], -n[2]))
+    return out, unisons, trimmed
+
+
+def write_midi(notes, ppq, out_path, target_ppq=None, tempo_map=None, time_sig=None):
     """target_ppq: rescale all tick values to this resolution before writing
     (ScorePrep's grid/quantization math assumes a fixed ticks-per-beat, so
     the output must match it rather than passing the source's own ppq
-    through untouched). tempo: source's real set_tempo (microsec/beat), if
-    known -- written into the output so downstream tools see genuine tempo
-    info instead of falling back to a generic-encoding-tempo assumption."""
+    through untouched). tempo_map: the source's full [(tick, microsec/beat)]
+    tempo list, rescaled and written as-is so tempo changes survive the
+    reduction. time_sig: the source's time_signature message, if any."""
     scale = (target_ppq / ppq) if (target_ppq and target_ppq != ppq) else 1.0
     out_ppq = target_ppq or ppq
 
@@ -360,15 +429,17 @@ def write_midi(notes, ppq, out_path, target_ppq=None, tempo=None):
     for st, et, pitch, vel, ti, name in notes:
         st2 = round(st * scale)
         et2 = round(et * scale)
-        events.append((st2, 1, mido.Message("note_on", note=pitch, velocity=vel, time=0)))
-        events.append((et2, 0, mido.Message("note_off", note=pitch, velocity=0, time=0)))
+        events.append((st2, 2, mido.Message("note_on", note=pitch, velocity=vel, time=0)))
+        events.append((et2, 1, mido.Message("note_off", note=pitch, velocity=0, time=0)))
+    for tick, tempo in (tempo_map or []):
+        events.append((round(tick * scale), 0, mido.MetaMessage("set_tempo", tempo=tempo, time=0)))
     events.sort(key=lambda e: (e[0], e[1]))
 
     mid = mido.MidiFile(ticks_per_beat=out_ppq)
     track = mido.MidiTrack()
     mid.tracks.append(track)
-    if tempo is not None:
-        track.append(mido.MetaMessage("set_tempo", tempo=tempo, time=0))
+    if time_sig is not None:
+        track.append(time_sig.copy(time=0))
     last = 0
     for t, _, msg in events:
         msg.time = t - last
@@ -378,7 +449,9 @@ def write_midi(notes, ppq, out_path, target_ppq=None, tempo=None):
 
 
 def chord_size_stats(slices):
-    sizes = [len(ns) for _, ns in slices if ns]
+    # distinct pitches (piano keys), not source notes -- a unison doubling
+    # is one key once written out
+    sizes = [len({n[2] for n in ns}) for _, ns in slices if ns]
     if not sizes:
         return 0.0, 0
     return sum(sizes) / len(sizes), max(sizes)
@@ -494,7 +567,7 @@ def run(input_path, output_path, max_chord_size=5, tolerance_frac=1/16, collapse
     track_priority = track_priority or []
     glide_tracks = glide_tracks or []
 
-    notes, ppq, tempo = load_notes(input_path)
+    notes, ppq, tempo_map, time_sig = load_notes(input_path)
     if not notes:
         print(f"Warning: no pitched notes found in '{input_path}' -- writing an empty output file.",
               file=sys.stderr)
@@ -526,11 +599,13 @@ def run(input_path, output_path, max_chord_size=5, tolerance_frac=1/16, collapse
     else:
         final_notes = [n for _, ns in post_thin_slices for n in ns]
 
+    final_notes, unisons_merged, overlaps_trimmed = merge_same_pitch_overlaps(final_notes, tol)
+
     out_dir = os.path.dirname(os.path.abspath(output_path))
     try:
         os.makedirs(out_dir, exist_ok=True)
         write_midi(final_notes, ppq, output_path,
-                   target_ppq=(target_ppq or None), tempo=tempo)
+                   target_ppq=(target_ppq or None), tempo_map=tempo_map, time_sig=time_sig)
     except OSError as e:
         raise ReduceTestError(f"Couldn't write output file '{output_path}': {e}")
 
@@ -538,6 +613,11 @@ def run(input_path, output_path, max_chord_size=5, tolerance_frac=1/16, collapse
     total_out = len(final_notes)
     print(f"slices: {len(post_thin_slices)}  notes in: {total_in}  notes out: {total_out}  "
           f"({100 * total_out / max(total_in, 1):.0f}% kept)")
+    if unisons_merged or overlaps_trimmed:
+        print(f"same-pitch cleanup -- {unisons_merged} unison doubling(s) merged into one key, "
+              f"{overlaps_trimmed} overlapping re-strike(s) cut where the next one starts")
+    if len(tempo_map) > 1:
+        print(f"tempo map -- {len(tempo_map)} tempo events carried over from the source")
     if melody_track or bass_track:
         print(f"register collisions -- buried melody: {stats['buried_melody']}  "
               f"buried bass: {stats['buried_bass']}  (of {len(post_thin_slices)} slices)")
@@ -555,7 +635,7 @@ def list_tracks(path):
     pitched note count (drum channel excluded), so a person can identify
     melody/bass/priority tracks by number without knowing raw file
     internals."""
-    notes, ppq, tempo = load_notes(path)
+    notes, ppq, _tempo_map, _time_sig = load_notes(path)
     counts = {}
     names = {}
     for n in notes:
