@@ -65,6 +65,10 @@ have a trustworthy one) is the expected common case.
   to the source's exact timing, more ties.
 - Tempo estimation: source file's own tempo → rhythm-pattern estimate →
   120 BPM fallback, with transparent reasoning printed at every step
+- Tempo-curve passthrough: a source with real tempo changes keeps them in
+  the output. A curve that looks like transcription jitter (big tempo
+  jumps packed within a bar of each other) is replaced by one
+  representative tempo instead; `--trust-tempo-curve` keeps it anyway
 - Time signature: read from the source, or `--time-sig`
 - Interactive step-by-step mode — just run `ScorePrep.py` with no
   arguments
@@ -163,9 +167,11 @@ trusting these:
   span), independent of `--grid`, and snaps just those onsets to exact
   even division instead of letting each one round independently to the
   outer grid. Not built on `classify_voice_roles` like the other three
-  here -- its own detection pass, see `docs/tuplet-detection-design.md`
-  for the algorithm and known limitations (partial-group matches,
-  fit-tolerance calibrated on only 3 pieces so far)
+  here -- its own detection pass, see the `detect_tuplet_groups`
+  docstring in `ScorePrep.py` for the algorithm and known limitations
+  (fit tolerance calibrated on only 3 pieces so far).
+  `--tuplet-fit-tolerance relative|absolute` sets how strictly a
+  candidate group must fit even spacing
 - The diagnostic report also gains three sections regardless of which
   experimental flags are on: **"Measures Needing Attention"** (bars with
   the most chord conflicts/rests/heavy ties, worth a manual look),
@@ -210,7 +216,7 @@ python3 ScorePrep.py --help
 
 | Option | Description |
 |---|---|
-| `--tempo` | Output tempo (BPM). Default: source's own tempo → rhythm estimate → 120 |
+| `--tempo` | Output tempo (BPM), flat for the whole piece. Default: the source's own tempo curve if it has a genuine one, otherwise source tempo → rhythm estimate → 120 |
 | `--time-sig N/D` | Time signature, e.g. `3/4`. Default: read from source, else 4/4 |
 | `--split-pitch` | MIDI note number for the treble/bass split. Default: estimated from pitch distribution |
 | `--tie-temperature` | `0.0`–`1.0` fidelity/readability dial |
@@ -235,6 +241,9 @@ python3 ScorePrep.py --help
 | `--hand-assignment {on,off}` | [experimental] Within each chord, reconsiders notes near the split point and moves them to whichever hand they're actually closer to, if doing so doesn't exceed `--max-hand-span`. Default: `off` |
 | `--max-hand-span N` | Widest pitch span (semitones) `--hand-assignment` allows within one hand's chord. Default: `16` (a 10th) |
 | `--hand-ambiguity-zone N` | How close (semitones) to the split point a note must be before `--hand-assignment` reconsiders it. Default: `3` |
+| `--tuplet-detection {auto,off}` | [experimental] Detect local n-tuplet bursts and 2-3 note clusters too tight for the grid, and space those onsets evenly. Default: `off` |
+| `--tuplet-fit-tolerance {relative,absolute}` | With `--tuplet-detection auto`: `relative` (default) requires a fit within 15% of the group's own subdivision width; `absolute` uses the older flat 24-tick threshold |
+| `--trust-tempo-curve` | Keep the source's multi-event tempo curve even when it looks like transcription jitter |
 | `--interactive` | Force step-by-step prompts |
 
 Run `ScorePrep.py --help` for full, current wording on every flag.
@@ -327,6 +336,12 @@ collapses repeated-attack/glide artifacts, and writes out a single-track
 MIDI at ScorePrep's expected 384 ticks-per-beat — meant to be fed into
 `ScorePrep.py` next, not a replacement for it.
 
+Chord size is counted in piano keys: two instruments doubling the same
+pitch become one key, and a pitch re-struck while still sounding is cut
+where the next strike starts, so what it writes is exactly what ScorePrep
+reads. The source's tempo changes and time signature are carried through
+to the output.
+
 This is a deliberate scope boundary, not an oversight: deciding *which
 notes survive* a reduction is an arrangement decision, while ScorePrep
 only ever decides *how to notate* content that's already settled. Kept
@@ -345,34 +360,101 @@ ScorePrep.py offers. Run `reduce_test.py --help` for the full flag list.
 
 Not promising a big list — just what's actively being considered next:
 
+- MusicXML export, as an alternative/additional output to MIDI --
+  potentially the highest-value item on this list. Right now ScorePrep
+  hands MuseScore a MIDI file, and MuseScore's own MIDI-import step
+  re-derives staff assignment, tie/rest structure, and note spelling
+  from scratch -- redoing (and sometimes second-guessing) decisions
+  ScorePrep already made carefully (duration optimizer, hand
+  assignment, tuplet tagging). A direct MusicXML export would carry
+  those decisions through exactly as computed instead of re-deriving
+  them through a lossy MIDI round-trip, and gives a real place to put
+  things MIDI has no room for at all -- key signatures, explicit tuplet
+  brackets, and eventually real ornament symbols (see ornament
+  detection above). Main technical cost: pitch spelling -- a MIDI note
+  number alone doesn't say whether it's a C# or a Db, which MusicXML
+  requires; would need real enharmonic spelling logic (key-aware,
+  probably informed by voice-leading) that doesn't currently exist
+  anywhere in the pipeline
+- Rebrand ScorePrep beyond "AI MIDI cleaner" into something bigger --
+  not yet scoped (what the bigger identity actually is, what stays vs.
+  changes in the pitch/positioning, whether the name itself changes).
+  Flagged as a direction to think through, not a concrete plan yet.
+- Local (non-AI) audio-to-MIDI transcription, as a new companion tool --
+  a classical-DSP alternative to what upstream AI transcribers (MT3,
+  ByteDance, Magenta) do, feeding into ScorePrep's existing cleanup
+  pipeline instead of depending on one. Realistic scope, broken down by
+  sub-problem (this is a research-depth gap in places, not just an
+  engineering one -- being upfront about where the ceiling actually is):
+  - Onset detection and tempo/beat tracking: solid without AI (spectral
+    flux, e.g. librosa/aubio's classical algorithms) -- not really a gap
+  - Monophonic pitch tracking (one voice/instrument at a time): also
+    solid without AI (YIN/autocorrelation-based)
+  - Polyphonic multi-pitch estimation (simultaneous notes/chords):
+    genuinely harder -- overlapping harmonics from simultaneous notes
+    are ambiguous from spectral data alone in a way classical methods
+    (NMF, harmonic sum spectra) measurably plateau on below deep
+    learning, per pre-2010s MIREX/MAPS benchmark results. Doable for
+    sparse voicing; hard for dense/heavily-pedaled material
+  - Multi-instrument separation from a mixed/mp3 source: the hardest
+    part and where the AI-vs-not gap is widest -- classical source
+    separation (NMF, ICA) generally needs more channels or stronger
+    assumptions than a stereo mp3 gives
+  - Realistic v1 scope: solo piano or a single melodic instrument,
+    reasonably sparse voicing -- not full mixed-band multi-instrument
+    transcription at AI-model quality, which isn't realistic classically
+- Improve and update `reduce_test.py` -- it's lagged behind
+  `ScorePrep.py`'s pace of development for a while now (last major work
+  was drum exclusion, pre-collapse pipeline, cross-track unison dedup,
+  voice importance scoring, register collision detection, glide/vibrato
+  collapse, interactive mode). Needs a fresh look at what it's missing
+  relative to where the main tool has moved since.
+- Ornament detection -- broader than the grace-note gap below: actual
+  recognition of recurring melodic ornament shapes (turns, mordents,
+  trills) as *named* ornaments, not just correctly-timed literal notes.
+  `--tuplet-detection auto`'s new sub-grid cluster pass (see Changelog)
+  already fixes the *timing* of these figures directly in the source
+  data during investigation, but still emits them as literal fast
+  notes -- this would be the next layer up: recognizing the shape
+  itself and notating it as a real ornament symbol instead.
 - ~~Irregular tuplet support~~ -- **implemented as `--tuplet-detection
   auto|off`** (default `off`, same unvalidated-experimental status as the
-  other three flags below), see Changelog and
-  `docs/tuplet-detection-design.md`. Doubles as per-passage auto-detection
+  other three flags below), see Changelog and the
+  `detect_tuplet_groups` docstring. Doubles as per-passage auto-detection
   as originally scoped. Remaining open items, in priority order:
   - Validate via `benchmark_experimental.py`'s new `tuplet` feature on
     real pieces (same bar the other three experimental features are
     already held to) before ever considering `auto` as the default.
-  - Greedy left-to-right matching can settle for a partial group (e.g.
-    catching 5 of a real 9-onset run, then falling back to normal
-    quantization for the rest) instead of holding out for a better
-    whole-group fit -- known v1 limitation, not yet addressed.
-  - Fixed 24-tick fit-tolerance was calibrated against only 3 pieces (one
-    confirmed tuplet-dense via its own notated score, two with no
-    independent evidence either way); worth revisiting as more real
-    pieces go through the benchmark.
+  - Fixed 24-tick fit-tolerance (n-tuplets) and 1x-GRID duration cutoff
+    (sub-grid clusters) were both calibrated against only a handful of
+    real pieces; worth revisiting as more real pieces go through the
+    benchmark.
+  - One known residual case, not yet addressed: a normal-duration note
+    landing right after a sub-grid cluster can still coincidentally
+    collide with that cluster's now-fixed anchor tick. Loosening the
+    duration cutoff to also catch it isn't safe on current evidence
+    (some real false-positive chord-jitter notes have durations as low
+    as 4-5 ticks) -- needs a different signal, not just a looser number.
 - ~~Full tempo-track passthrough~~ -- done, see Changelog. While
   investigating this on the same real piece above, also found and fixed
   a bigger, previously-unknown bug: non-384-PPQ sources were never
   actually rescaled into the internal grid space, silently distorting
   quantization on any such file (~25% for a 480-PPQ source, compounding
-  over the piece) -- see Changelog for details
+  over the piece) -- see Changelog for details. Later hardened further:
+  erratic multi-event tempo curves (transcription timing jitter
+  mislabeled as tempo changes, not real macro tempo direction) are now
+  auto-detected and discarded in favor of one estimated representative
+  tempo, with `--trust-tempo-curve` as an explicit override -- see
+  Changelog.
 - Grace-note detection/notation -- currently no dedicated classifier;
   short grace notes either get caught by `--min-note-ticks` filtering or
   survive as oddly-short competing notes rather than real grace-note
   glyphs. Moderate effort (duration alone can't distinguish a grace note
   from a legitimately fast written note) and moderate frequency across
-  expressive piano arrangements generally
+  expressive piano arrangements generally. Related to the ornament
+  detection item above but distinct: a true grace note has no rhythmic
+  value of its own at all, which is a different data model than a
+  fast-but-real ornament note
 - Mid-passage clef borrowing (a fast run temporarily notated in the
   other staff's clef to avoid ledger lines) -- lowest priority: rarest of
   the four, and would need a genuinely different per-note clef data model
@@ -396,10 +478,9 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## Notes / assumptions
 
-- Assumes a source resolution of 384 ticks per beat (the default for
-  ByteDance / MT3 / Magenta piano transcription exports). If your file
-  uses a different resolution, the script still runs but warns that the
-  grid/bar math may be off.
+- Works internally at 384 ticks per beat (the default for ByteDance /
+  MT3 / Magenta piano transcription exports). A source at any other
+  resolution (e.g. 480 from most DAWs) is rescaled to it on load.
 - Picks whichever track in the source file has the most `note_on`
   events by default (overridable with `--track`/`--channel`).
 
